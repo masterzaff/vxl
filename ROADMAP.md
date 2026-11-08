@@ -29,7 +29,7 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
 
 *Goal: one cron line backs up everything, correctly, every night.*
 
-1. **Whole-server snapshots.** `vxl backup ~/server` backs up several worlds as **one
+1. ✅ **Whole-server snapshots.** `vxl backup ~/server` backs up several worlds as **one
    snapshot**, and only worlds: plugins, configs, logs and jars are left to a normal file
    backup. Which worlds is set by `worlds` in the config (`--world` on the CLI):
    - `"*"` (the default) or `["*"]`: every world found;
@@ -38,8 +38,9 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
 
    **What counts as a world:** a folder with a `level.dat`, found up to two levels below the
    server folder (so `world/` and `worlds/world1/`, e.g. with Paper's `--world-container`).
-   Search stops descending once it finds one, and skips `plugins/`, `backups/`, `logs/`,
-   `cache/` and `libraries/` so a plugin's own world copies aren't picked up. Every backup
+   Search stops descending once it finds one, and skips hidden folders, `plugins/`, `mods/`,
+   `config/`, `backups/`, `logs/`, `cache/`, `libraries/`, `versions/` and `crash-reports/`
+   so a plugin's own world copies aren't picked up. Every backup
    prints the worlds it found.
 
    **A world is named by its own folder:** `worlds/world1` is stored as `world1`. Two
@@ -48,7 +49,8 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
    the nested dimensions of vanilla/Fabric/Forge (`world/DIM-1`, `world/DIM1`,
    `world/dimensions/<mod>/<name>/`) come along with `world`, while Paper's separate
    `world_nether` / `world_the_end` and Multiverse worlds are worlds of their own. A matched
-   world that is a symlink is followed (inside a world, symlinks are still skipped).
+   world that is a symlink is followed (inside a world, symlinks are still skipped). Selecting
+   a world and another world inside it is an error.
 
    **Storage:** a snapshot becomes a list of worlds, each with its name, where it was found,
    and its own file list with paths relative to that world, exactly like today's
@@ -56,8 +58,11 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
    change and identical content across worlds is stored once. The manifest version goes up
    by one; older snapshots read as a single world named after their source folder.
 
-   **Restore:** `vxl restore <id> <dest>` writes every world to `<dest>/<name>/`;
-   `--world abc` writes just that one as a standalone world folder, ready to load or hand
+   **Restore:** `vxl restore <id> <dest>` puts every world where it was in the server
+   (`<dest>/world_nether`, `<dest>/worlds/lobby`) and writes nothing else, so restoring into
+   the server folder rolls the worlds back in place; if any world fails to rebuild, none is
+   touched. A snapshot of a single world folder still restores as that folder. `--world abc`
+   writes just that one into `<dest>` as a standalone world folder, ready to load or hand
    to someone. A world's blocks restore on their own, but player data (inventories,
    positions, stats, advancements) lives only in the main world's `playerdata/`,
    `stats/` and `advancements/`, so restoring just `world_nether` doesn't roll back anyone's

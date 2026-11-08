@@ -1,12 +1,12 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 
 use crate::anvil::{self, Compression, RawChunk};
-use crate::manifest::{FileEntry, safe_rel_path};
+use crate::manifest::{FileEntry, Snapshot, World, safe_rel_path};
 use crate::repo::{ObjectId, Repo};
 
 /// What to do when the target folder already has something in it.
@@ -24,6 +24,8 @@ pub enum Mode {
 
 pub struct RestoreReport {
     pub id: ObjectId,
+    /// Each restored world and the folder it went to.
+    pub worlds: Vec<(String, PathBuf)>,
     pub files: u64,
     pub chunks: u64,
     /// Existing files that were overwritten (`Replace`).
@@ -36,51 +38,104 @@ pub struct RestoreReport {
 /// and atomic) and are skipped by `world::scan`.
 pub const STAGING_PREFIX: &str = ".vxl-staging-";
 
-/// Rebuild snapshot `id` into `target`.
+/// Where each world of a snapshot goes when restoring into `target`:
+/// - `only = Some(name)`: just that world, into `target` itself;
+/// - a snapshot of a single world (backed up as `vxl backup path/to/world`): into `target`;
+/// - otherwise (a server folder): each world where it was in the server folder
+///   (`target/world_nether/`, `target/worlds/lobby/`), so restoring into the server
+///   folder itself puts every world back in place and touches nothing else.
+pub fn plan<'a>(snap: &'a Snapshot, target: &Path, only: Option<&str>) -> Result<Vec<(&'a World, PathBuf)>> {
+    if let Some(name) = only {
+        return Ok(vec![(snap.world(name)?, target.to_path_buf())]);
+    }
+    if let [w] = snap.worlds.as_slice()
+        && w.path == "."
+    {
+        return Ok(vec![(w, target.to_path_buf())]);
+    }
+    snap.worlds.iter().map(|w| Ok((w, target.join(safe_rel_path(&w.path)?)))).collect()
+}
+
+/// Rebuild snapshot `id` (or only its world `only`) into `target`; see [`plan`].
 ///
-/// For a non-empty target (`Replace`/`Wipe`) the whole snapshot is first rebuilt
-/// in a staging folder; the target is only touched once that has fully succeeded.
+/// Every world folder that isn't empty (`Replace`/`Wipe`) is first rebuilt in a
+/// staging folder, and nothing existing is touched until *all* worlds have been
+/// rebuilt successfully.
 pub fn restore(
     repo: &Repo,
     id: &ObjectId,
     target: &Path,
+    only: Option<&str>,
     mode: Mode,
     progress: &ProgressBar,
 ) -> Result<RestoreReport> {
     let snap = repo.load_snapshot(id)?;
-    let mut report =
-        RestoreReport { id: *id, files: snap.files.len() as u64, chunks: 0, replaced: 0, wiped: 0 };
-
-    let non_empty = target.exists() && {
-        if !target.is_dir() {
-            bail!("{} exists and is not a folder", target.display());
-        }
-        fs::read_dir(target)?.next().is_some()
+    let plan = plan(&snap, target, only)?;
+    let mut report = RestoreReport {
+        id: *id,
+        worlds: plan.iter().map(|(w, d)| (w.name.clone(), d.clone())).collect(),
+        files: plan.iter().map(|(w, _)| w.files.len() as u64).sum(),
+        chunks: 0,
+        replaced: 0,
+        wiped: 0,
     };
-    if !non_empty {
-        fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
-        report.chunks = write_all(repo, &snap.files, target, progress)?;
-        return Ok(report);
+
+    // Check every destination before writing anything.
+    let mut staged = Vec::with_capacity(plan.len()); // (world, dest, staging folder if non-empty)
+    for (w, dest) in &plan {
+        let non_empty = dest.exists() && {
+            if !dest.is_dir() {
+                bail!("{} exists and is not a folder", dest.display());
+            }
+            fs::read_dir(dest)?.next().is_some()
+        };
+        if non_empty {
+            check_overwrite_allowed(repo, dest, mode)?;
+        }
+        let staging = non_empty.then(|| dest.join(format!("{STAGING_PREFIX}{}", std::process::id())));
+        staged.push((*w, dest.as_path(), staging));
     }
 
-    check_overwrite_allowed(repo, target, mode)?;
-    let staging = target.join(format!("{STAGING_PREFIX}{}", std::process::id()));
-    fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
-    match write_all(repo, &snap.files, &staging, progress) {
-        Ok(n) => report.chunks = n,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(e.context(format!("restore failed; {} was not changed", target.display())));
+    // Write: fresh folders directly, the others into their staging folders.
+    progress.set_length(report.files);
+    let cleanup = |staged: &[(&World, &Path, Option<PathBuf>)]| {
+        for s in staged.iter().filter_map(|s| s.2.as_ref()) {
+            let _ = fs::remove_dir_all(s);
+        }
+    };
+    for (w, dest, staging) in &staged {
+        let dir = staging.as_deref().unwrap_or(dest);
+        let r = if staging.is_some() { fs::create_dir(dir) } else { fs::create_dir_all(dir) }
+            .with_context(|| format!("creating {}", dir.display()))
+            .and_then(|()| write_all(repo, &w.files, dir, progress));
+        match r {
+            Ok(n) => report.chunks += n,
+            Err(e) => {
+                cleanup(&staged);
+                let unchanged = staged.iter().filter(|s| s.2.is_some()).map(|s| s.1.display().to_string());
+                let unchanged: Vec<String> = unchanged.collect();
+                let note = match unchanged.len() {
+                    0 => String::new(),
+                    1 => format!("; {} was not changed", unchanged[0]),
+                    _ => format!("; {} were not changed", unchanged.join(", ")),
+                };
+                return Err(e.context(format!("restore of world {:?} failed{note}", w.name)));
+            }
         }
     }
-    let commit = match mode {
-        Mode::Wipe => commit_wipe(target, &staging, &mut report),
-        _ => commit_replace(&staging, target, &mut report),
-    };
-    commit.with_context(|| {
-        format!("moving files into place failed; the complete restored world is in {}", staging.display())
-    })?;
-    fs::remove_dir_all(&staging)?;
+
+    // Commit the staged worlds.
+    for (_, dest, staging) in &staged {
+        let Some(staging) = staging else { continue };
+        let commit = match mode {
+            Mode::Wipe => commit_wipe(dest, staging, &mut report),
+            _ => commit_replace(staging, dest, &mut report),
+        };
+        commit.with_context(|| {
+            format!("moving files into place failed; the complete restored world is in {}", staging.display())
+        })?;
+        fs::remove_dir_all(staging)?;
+    }
     Ok(report)
 }
 
@@ -106,7 +161,6 @@ fn check_overwrite_allowed(repo: &Repo, target: &Path, mode: Mode) -> Result<()>
 }
 
 fn write_all(repo: &Repo, files: &[FileEntry], dir: &Path, progress: &ProgressBar) -> Result<u64> {
-    progress.set_length(files.len() as u64);
     files
         .par_iter()
         .map(|f| {

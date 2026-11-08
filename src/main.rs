@@ -38,9 +38,16 @@ enum Cmd {
         #[arg(long, default_value_t = repo::DEFAULT_PACK_SIZE >> 20)]
         pack_size_mb: u64,
     },
-    /// Snapshot a world. Only new or changed chunks are stored.
+    /// Snapshot a world, or every world in a server folder, as one snapshot.
+    /// Only new or changed chunks are stored.
     Backup {
-        world: PathBuf,
+        /// A world folder, or a server folder: then every folder with a level.dat up to two
+        /// levels down is a world (except in plugins/, backups/, logs/ and similar).
+        source: PathBuf,
+        /// Which worlds to back up: a folder name (`world_nether`), a path under SOURCE
+        /// (`worlds/lobby`), `*` for all, `!name` to leave one out. Repeatable; default `*`.
+        #[arg(long = "world", short = 'w', value_name = "WORLD")]
+        worlds: Vec<String>,
         #[command(flatten)]
         repo: RepoArg,
         /// Note to attach to the snapshot.
@@ -53,11 +60,20 @@ enum Cmd {
         repo: RepoArg,
     },
     /// Rebuild a snapshot into a new folder (never touches the live world).
+    ///
+    /// A snapshot of one world folder restores as that world folder. A snapshot of a server
+    /// folder restores each world where it was in the server (TARGET/world_nether,
+    /// TARGET/worlds/lobby, …) and nothing else. With --world, just that world is restored,
+    /// into TARGET itself.
     Restore {
         /// Snapshot id (any unique prefix).
         snapshot: String,
-        /// Folder to restore into; must not exist or be empty unless --force/--force-wipe.
+        /// Folder to restore into. Each world folder in it must not exist or be empty unless
+        /// --force/--force-wipe.
         target: PathBuf,
+        /// Restore only this world (by name, see `vxl list`), as a standalone world folder.
+        #[arg(long, short = 'w')]
+        world: Option<String>,
         /// Target is an existing world: overwrite the files the snapshot has, keep any others.
         #[arg(long, conflicts_with = "force_wipe")]
         force: bool,
@@ -145,13 +161,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("initialized empty vxl repository in {}", path.display());
         }
 
-        Cmd::Backup { world, repo, message } => {
+        Cmd::Backup { source, worlds, repo, message } => {
             let repo = open(&repo, LockMode::Exclusive)?;
             let start = Instant::now();
             let pb = bar("backing up", true);
-            let r = backup::backup(&repo, &world, message, &pb)?;
+            let r = backup::backup(&repo, &source, &worlds, message, &pb)?;
             pb.finish_and_clear();
             print_warnings(&r.warnings);
+            if r.worlds.len() > 1 || r.worlds[0].rel != "." {
+                let names: Vec<String> = r
+                    .worlds
+                    .iter()
+                    .map(|w| if w.rel == w.name { w.name.clone() } else { format!("{} ({})", w.name, w.rel) })
+                    .collect();
+                println!("worlds: {}", names.join(", "));
+            }
             let s = &r.stats;
             println!(
                 "snapshot {} | {} chunks | {} new | +{} stored ({:.1}s)",
@@ -178,16 +202,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .unwrap_or(0);
             for (id, h) in &snaps {
                 println!(
-                    "{}  {}  {:width$}  +{}",
+                    "{}  {}  {:width$}  +{:<9}  {}",
                     short(id, len),
                     h.created.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
                     h.message.as_deref().unwrap_or(""),
                     human_bytes(h.stats.stored_bytes),
+                    h.world_names.join(", "),
                 );
             }
         }
 
-        Cmd::Restore { snapshot, target, force, force_wipe, repo } => {
+        Cmd::Restore { snapshot, target, world, force, force_wipe, repo } => {
             let repo = open(&repo, LockMode::Shared)?;
             let id = repo.resolve(&snapshot)?;
             let mode = match (force, force_wipe) {
@@ -196,25 +221,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 _ => restore::Mode::Fresh,
             };
             if mode != restore::Mode::Fresh {
-                let source = repo.load_header(&id)?.source;
-                if target.canonicalize().is_ok_and(|t| t.display().to_string() == source) {
+                let source = PathBuf::from(repo.load_header(&id)?.source);
+                if target.canonicalize().is_ok_and(|t| t.starts_with(&source)) {
                     eprintln!(
                         "warning: restoring over the world this snapshot came from; make sure the server is stopped"
                     );
                 }
             }
             let pb = bar("restoring", false);
-            let r = restore::restore(&repo, &id, &target, mode, &pb)?;
+            let r = restore::restore(&repo, &id, &target, world.as_deref(), mode, &pb)?;
             pb.finish_and_clear();
             let extra = match mode {
                 restore::Mode::Fresh => String::new(),
                 restore::Mode::Replace => format!(" | {} replaced", thousands(r.replaced)),
                 restore::Mode::Wipe => format!(" | wiped {} old entries", thousands(r.wiped)),
             };
+            let into = match r.worlds.as_slice() {
+                [(_, dest)] if *dest == target => target.display().to_string(),
+                ws => format!(
+                    "{} ({})",
+                    target.display(),
+                    ws.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            };
             println!(
-                "restored {} into {} | {} files | {} chunks{extra}",
+                "restored {} into {into} | {} files | {} chunks{extra}",
                 short(&r.id, 6),
-                target.display(),
                 thousands(r.files),
                 thousands(r.chunks)
             );

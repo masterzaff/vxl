@@ -456,12 +456,20 @@ impl Repo {
 
     pub fn load_snapshot(&self, id: &ObjectId) -> Result<Snapshot> {
         let json = self.read_snapshot_json(id)?;
-        serde_json::from_slice(&json).with_context(|| format!("parsing snapshot {id}"))
+        let mut snap: Snapshot =
+            serde_json::from_slice(&json).with_context(|| format!("parsing snapshot {id}"))?;
+        check_version(id, snap.header.version)?;
+        snap.upgrade();
+        Ok(snap)
     }
 
     pub fn load_header(&self, id: &ObjectId) -> Result<SnapshotHeader> {
         let json = self.read_snapshot_json(id)?;
-        serde_json::from_slice(&json).with_context(|| format!("parsing snapshot {id}"))
+        let mut h: SnapshotHeader =
+            serde_json::from_slice(&json).with_context(|| format!("parsing snapshot {id}"))?;
+        check_version(id, h.version)?;
+        h.upgrade();
+        Ok(h)
     }
 
     pub fn delete_snapshot(&self, id: &ObjectId) -> Result<()> {
@@ -483,6 +491,17 @@ impl Repo {
             _ => bail!("{prefix:?} is ambiguous ({} snapshots match); use more characters", matches.len()),
         }
     }
+}
+
+/// Refuse manifests from a newer vxl rather than misreading them.
+fn check_version(id: &ObjectId, version: u32) -> Result<()> {
+    if version > crate::manifest::FORMAT_VERSION {
+        bail!(
+            "snapshot {id} uses manifest format {version}, but this vxl only knows up to {}; upgrade vxl",
+            crate::manifest::FORMAT_VERSION
+        );
+    }
+    Ok(())
 }
 
 fn decode_verified(id: &ObjectId, packed: &[u8]) -> Result<Vec<u8>> {

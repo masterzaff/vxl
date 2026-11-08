@@ -75,12 +75,12 @@ fn hidden() -> ProgressBar {
 }
 
 fn do_backup(env: &Env, msg: &str) -> backup::BackupReport {
-    backup::backup(&repo(env), &env.world, Some(msg.into()), &hidden()).unwrap()
+    backup::backup(&repo(env), &env.world, &[], Some(msg.into()), &hidden()).unwrap()
 }
 
 fn do_restore(env: &Env, id: &ObjectId, name: &str) -> std::path::PathBuf {
     let target = env.base.join(name);
-    restore::restore(&repo(env), id, &target, restore::Mode::Fresh, &hidden()).unwrap();
+    restore::restore(&repo(env), id, &target, None, restore::Mode::Fresh, &hidden()).unwrap();
     target
 }
 
@@ -255,7 +255,7 @@ fn verify_catches_damage_and_restore_refuses_non_empty_target() {
     let busy = env.base.join("busy");
     fs::create_dir_all(&busy).unwrap();
     fs::write(busy.join("keep.txt"), b"mine").unwrap();
-    assert!(restore::restore(&repo(&env), &id, &busy, restore::Mode::Fresh, &hidden()).is_err());
+    assert!(restore::restore(&repo(&env), &id, &busy, None, restore::Mode::Fresh, &hidden()).is_err());
     assert_eq!(fs::read(busy.join("keep.txt")).unwrap(), b"mine");
 
     let (victim, _) = repo(&env).list_objects().into_iter().max_by_key(|o| o.1).unwrap();
@@ -273,7 +273,7 @@ fn refuses_repo_inside_world() {
     let repo_dir = world.join("backups");
     Repo::init(&repo_dir, 3, TEST_PACK_SIZE).unwrap();
     let repo = Repo::open(&repo_dir, LockMode::Exclusive).unwrap();
-    let err = backup::backup(&repo, &world, None, &hidden()).err().unwrap();
+    let err = backup::backup(&repo, &world, &[], None, &hidden()).err().unwrap();
     assert!(err.to_string().contains("inside the world"));
 }
 
@@ -323,7 +323,7 @@ fn force_replace_overwrites_but_keeps_extras() {
     let id = do_backup(&env, "x").id;
     diverge(&env);
 
-    let r = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Replace, &hidden()).unwrap();
+    let r = restore::restore(&repo(&env), &id, &env.world, None, restore::Mode::Replace, &hidden()).unwrap();
     assert_eq!(r.replaced, 3); // level.dat, playerdata, region/r.0.0.mca
     let now = contents(&env.world);
     for (path, c) in &snap {
@@ -346,7 +346,7 @@ fn force_wipe_makes_target_exactly_the_snapshot() {
     fs::create_dir_all(env.world.join("stats/deep")).unwrap();
     fs::write(env.world.join("stats/deep/x.json"), b"{}").unwrap();
 
-    let r = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Wipe, &hidden()).unwrap();
+    let r = restore::restore(&repo(&env), &id, &env.world, None, restore::Mode::Wipe, &hidden()).unwrap();
     assert!(r.wiped > 0);
     assert_eq!(contents(&env.world), snap);
     assert!(!env.world.join("stats").exists());
@@ -364,7 +364,7 @@ fn force_refuses_non_worlds_and_failed_restores_change_nothing() {
     fs::create_dir_all(&home).unwrap();
     fs::write(home.join("thesis.docx"), b"precious").unwrap();
     for mode in [restore::Mode::Replace, restore::Mode::Wipe] {
-        let err = restore::restore(&repo(&env), &id, &home, mode, &hidden()).err().unwrap();
+        let err = restore::restore(&repo(&env), &id, &home, None, mode, &hidden()).err().unwrap();
         assert!(err.to_string().contains("no level.dat"), "{err}");
         assert_eq!(fs::read(home.join("thesis.docx")).unwrap(), b"precious");
     }
@@ -375,7 +375,8 @@ fn force_refuses_non_worlds_and_failed_restores_change_nothing() {
     let before = contents(&env.world);
     let (victim, _) = repo(&env).list_objects().into_iter().max_by_key(|o| o.1).unwrap();
     damage(&env, &victim);
-    let err = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Wipe, &hidden()).err().unwrap();
+    let err =
+        restore::restore(&repo(&env), &id, &env.world, None, restore::Mode::Wipe, &hidden()).err().unwrap();
     assert!(format!("{err:#}").contains("was not changed"), "{err:#}");
     assert_eq!(contents(&env.world), before);
     assert_no_staging(&env.world);
@@ -458,4 +459,162 @@ fn compare_confirms_restores_and_catches_differences() {
     fs::write(&path, bytes).unwrap();
     let r = compare(&env.world, &out).unwrap();
     assert!(r.layout_problems.iter().any(|p| p.contains("share sectors")), "{:?}", r.layout_problems);
+}
+
+/// A Paper-style server folder: three worlds side by side, one under `worlds/`,
+/// plus things that aren't worlds (including a plugin's world copy).
+fn server(env: &Env) -> std::path::PathBuf {
+    let s = env.base.join("server");
+    synth::write_world(&s.join("world"), 20, &[(0, 0)], 30, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("world_nether"), 21, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("worlds/lobby"), 22, &[(-1, 0)], 10, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("plugins/Backup/world"), 23, &[(0, 0)], 40, Compression::Zlib, |_, _| 0)
+        .unwrap();
+    fs::create_dir_all(s.join("logs")).unwrap();
+    fs::write(s.join("server.properties"), b"motd=hi").unwrap();
+    s
+}
+
+fn without_lock(mut c: BTreeMap<String, Content>) -> BTreeMap<String, Content> {
+    c.remove("session.lock");
+    c
+}
+
+#[test]
+fn server_folder_backs_up_every_world_as_one_snapshot() {
+    let env = setup();
+    let s = server(&env);
+    let r = backup::backup(&repo(&env), &s, &[], Some("all".into()), &hidden()).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let names: Vec<_> = r.worlds.iter().map(|w| (w.name.as_str(), w.rel.as_str())).collect();
+    assert_eq!(names, [("world", "world"), ("world_nether", "world_nether"), ("lobby", "worlds/lobby")]);
+    assert_eq!(r.stats.chunks, 60, "the plugin's copy is not backed up");
+
+    let h = repo(&env).load_header(&r.id).unwrap();
+    assert_eq!(h.world_names, ["world", "world_nether", "lobby"]);
+
+    // Everything: each world where it was in the server folder, and nothing else.
+    let out = env.base.join("out");
+    let rep = restore::restore(&repo(&env), &r.id, &out, None, restore::Mode::Fresh, &hidden()).unwrap();
+    assert_eq!(rep.worlds.len(), 3);
+    for rel in ["world", "world_nether", "worlds/lobby"] {
+        assert_eq!(contents(&out.join(rel)), without_lock(contents(&s.join(rel))), "{rel}");
+    }
+    assert!(!out.join("server.properties").exists() && !out.join("plugins").exists());
+
+    // One world, as a standalone world folder.
+    let lobby = env.base.join("just-lobby");
+    let rep =
+        restore::restore(&repo(&env), &r.id, &lobby, Some("lobby"), restore::Mode::Fresh, &hidden()).unwrap();
+    assert_eq!(rep.worlds, [("lobby".to_string(), lobby.clone())]);
+    assert_eq!(contents(&lobby), without_lock(contents(&s.join("worlds/lobby"))));
+
+    let err = restore::restore(
+        &repo(&env),
+        &r.id,
+        &env.base.join("x"),
+        Some("nope"),
+        restore::Mode::Fresh,
+        &hidden(),
+    )
+    .err()
+    .unwrap();
+    assert!(err.to_string().contains("has no world \"nope\""), "{err}");
+
+    // Selecting fewer worlds.
+    let some = ["*".to_string(), "!lobby".to_string()];
+    let r2 = backup::backup(&repo(&env), &s, &some, None, &hidden()).unwrap();
+    assert_eq!(repo(&env).load_header(&r2.id).unwrap().world_names, ["world", "world_nether"]);
+    assert_eq!(r2.stats.new_chunks, 0);
+}
+
+#[test]
+fn copied_worlds_are_stored_once() {
+    let env = setup();
+    let s = env.base.join("server");
+    synth::write_world(&s.join("arena1"), 30, &[(0, 0)], 50, Compression::Zlib, |_, _| 0).unwrap();
+    let one = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap();
+    synth::write_world(&s.join("arena2"), 30, &[(0, 0)], 50, Compression::Zlib, |_, _| 0).unwrap();
+    let two = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap();
+    assert_eq!(two.stats.chunks, 100);
+    assert_eq!(two.stats.new_chunks, 0, "arena2 is a copy of arena1");
+    assert!(two.stats.stored_bytes < one.stats.stored_bytes / 20);
+}
+
+#[test]
+fn restoring_a_server_over_itself_touches_only_worlds() {
+    let env = setup();
+    let s = server(&env);
+    let id = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap().id;
+    let before: Vec<_> =
+        ["world", "world_nether", "worlds/lobby"].map(|w| without_lock(contents(&s.join(w)))).into();
+
+    // The server moves on: a new region in one world, a new plugin file.
+    synth::write_world(&s.join("world_nether"), 21, &[(0, 0), (3, 3)], 20, Compression::Zlib, |_, _| 7)
+        .unwrap();
+    fs::write(s.join("plugins/new.jar"), b"jar").unwrap();
+
+    // Roll the whole server back in place.
+    let r = restore::restore(&repo(&env), &id, &s, None, restore::Mode::Wipe, &hidden()).unwrap();
+    assert_eq!(r.worlds.len(), 3);
+    let all: Vec<_> =
+        ["world", "world_nether", "worlds/lobby"].map(|w| without_lock(contents(&s.join(w)))).into();
+    assert_eq!(all, before);
+    assert_eq!(fs::read(s.join("plugins/new.jar")).unwrap(), b"jar");
+    assert_eq!(fs::read(s.join("server.properties")).unwrap(), b"motd=hi");
+}
+
+#[test]
+fn a_failed_multi_world_restore_changes_nothing() {
+    let env = setup();
+    let s = env.base.join("server");
+    synth::write_world(&s.join("a"), 40, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("b"), 41, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    let id = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap().id;
+
+    // Both worlds move on, then one object of `b` gets damaged.
+    synth::write_world(&s.join("a"), 40, &[(0, 0)], 20, Compression::Zlib, |_, _| 3).unwrap();
+    synth::write_world(&s.join("b"), 41, &[(0, 0)], 20, Compression::Zlib, |_, _| 3).unwrap();
+    let before = (contents(&s.join("a")), contents(&s.join("b")));
+    let snap = repo(&env).load_snapshot(&id).unwrap();
+    let victim = snap.world("b").unwrap().files.iter().flat_map(|f| f.objects()).last().unwrap();
+    damage(&env, &victim);
+
+    let err = restore::restore(&repo(&env), &id, &s, None, restore::Mode::Wipe, &hidden()).err().unwrap();
+    assert!(format!("{err:#}").contains("were not changed"), "{err:#}");
+    assert_eq!((contents(&s.join("a")), contents(&s.join("b"))), before, "`a` must not be restored alone");
+    assert_no_staging(&s.join("a"));
+    assert_no_staging(&s.join("b"));
+}
+
+#[test]
+fn cli_server_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = tmp.path().join("server");
+    let repo = tmp.path().join("repo");
+    synth::write_world(&s.join("world"), 50, &[(0, 0)], 10, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("world_the_end"), 51, &[(0, 0)], 5, Compression::Zlib, |_, _| 0).unwrap();
+    let vxl = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_vxl")).args(args).env("VXL_REPO", &repo).output().unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        stdout
+    };
+    vxl(&["init", repo.to_str().unwrap()]);
+    let out = vxl(&["backup", s.to_str().unwrap()]);
+    assert!(out.starts_with("worlds: world, world_the_end\nsnapshot "), "{out}");
+    assert!(out.contains("| 15 chunks |"), "{out}");
+    let out = vxl(&["backup", s.to_str().unwrap(), "-w", "world_the_end"]);
+    assert!(out.contains("| 5 chunks |"), "{out}");
+    let listing = vxl(&["list"]);
+    assert!(
+        listing.contains("world, world_the_end")
+            && listing.lines().next().unwrap().ends_with("world_the_end")
+    );
+
+    let id = &listing[..6];
+    let end = tmp.path().join("end");
+    let out = vxl(&["restore", id, end.to_str().unwrap(), "--world", "world_the_end"]);
+    assert!(out.contains(&format!("into {} |", end.display())), "{out}");
+    assert!(end.join("level.dat").exists() && end.join("region/r.0.0.mca").exists());
 }

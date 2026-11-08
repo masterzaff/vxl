@@ -1,6 +1,10 @@
-//! The snapshot manifest: a list of every file in the world and, for region
-//! files, every chunk and the object that holds it. Stored as zstd-compressed
-//! JSON in `snapshots/<id>.json.zst`, where `id` is the BLAKE3 of the JSON.
+//! The snapshot manifest: the worlds in a snapshot, every file in each world and,
+//! for region files, every chunk and the object that holds it. Stored as
+//! zstd-compressed JSON in `snapshots/<id>.json.zst`, where `id` is the BLAKE3 of
+//! the JSON.
+//!
+//! Version 1 had a single world's file list at the top level; it is read as a
+//! snapshot with one world named after its source folder (see [`Snapshot::upgrade`]).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -10,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::repo::ObjectId;
 
-pub const FORMAT_VERSION: u32 = 1;
+/// 2: a snapshot holds several worlds (`worlds`), each with its own file list.
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
@@ -34,8 +39,41 @@ pub struct SnapshotHeader {
     pub version: u32,
     pub created: DateTime<Utc>,
     pub message: Option<String>,
+    /// The folder that was backed up: a world, or a server folder holding worlds.
     pub source: String,
+    /// Totals across all worlds.
     pub stats: Stats,
+    /// Names of the worlds in this snapshot, in manifest order.
+    #[serde(default)]
+    pub world_names: Vec<String>,
+}
+
+impl SnapshotHeader {
+    /// Fill in what version 1 didn't record.
+    pub fn upgrade(&mut self) {
+        if self.version < 2 && self.world_names.is_empty() {
+            self.world_names.push(v1_world_name(&self.source));
+        }
+    }
+}
+
+/// A version-1 snapshot is one world; name it after the folder it came from.
+fn v1_world_name(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| is_valid_world_name(n))
+        .unwrap_or("world")
+        .to_string()
+}
+
+/// A world name becomes a folder name on restore, so it must be one plain path component.
+pub fn is_valid_world_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && safe_rel_path(name).is_ok()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +81,21 @@ pub struct Snapshot {
     #[serde(flatten)]
     pub header: SnapshotHeader,
     /// Kept last in the JSON so the header is cheap to parse.
+    #[serde(default)]
+    pub worlds: Vec<World>,
+    /// Version 1 only: the single world's files. Moved into `worlds` by [`Snapshot::upgrade`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct World {
+    /// Folder name of the world; what it's restored as and what `--world` selects.
+    pub name: String,
+    /// Where it was found, relative to the snapshot's source (`.` if the source was this world).
+    pub path: String,
+    pub stats: Stats,
+    /// Paths are relative to the world folder, exactly like a single-world backup.
     pub files: Vec<FileEntry>,
 }
 
@@ -88,7 +141,28 @@ pub struct ChunkEntry {
 
 impl Snapshot {
     pub fn objects(&self) -> impl Iterator<Item = ObjectId> + '_ {
-        self.files.iter().flat_map(|f| f.objects())
+        self.worlds.iter().flat_map(|w| &w.files).flat_map(|f| f.objects())
+    }
+
+    /// Bring an older manifest into the current shape (in memory only; the stored
+    /// bytes, and so the snapshot id, never change).
+    pub fn upgrade(&mut self) {
+        self.header.upgrade();
+        if self.header.version < 2 && self.worlds.is_empty() {
+            self.worlds.push(World {
+                name: self.header.world_names[0].clone(),
+                path: ".".into(),
+                stats: self.header.stats.clone(),
+                files: std::mem::take(&mut self.files),
+            });
+        }
+    }
+
+    pub fn world(&self, name: &str) -> Result<&World> {
+        self.worlds.iter().find(|w| w.name == name).ok_or_else(|| {
+            let names: Vec<&str> = self.worlds.iter().map(|w| w.name.as_str()).collect();
+            anyhow::anyhow!("this snapshot has no world {name:?} (it has: {})", names.join(", "))
+        })
     }
 }
 
@@ -113,5 +187,35 @@ mod tests {
         assert!(safe_rel_path("/etc/passwd").is_err());
         assert!(safe_rel_path("a/./b").is_ok()); // `.` components are normalised away
         assert!(safe_rel_path("").is_err());
+    }
+
+    #[test]
+    fn world_names() {
+        assert!(is_valid_world_name("world_nether"));
+        assert!(!is_valid_world_name("a/b"));
+        assert!(!is_valid_world_name(".."));
+        assert!(!is_valid_world_name("."));
+        assert!(!is_valid_world_name(""));
+        assert_eq!(v1_world_name("/srv/mc/survival"), "survival");
+        assert_eq!(v1_world_name("/"), "world");
+    }
+
+    #[test]
+    fn v1_manifest_reads_as_one_world() {
+        let json = r#"{"version":1,"created":"2026-11-08T08:00:00Z","message":null,
+            "source":"/srv/mc/world","stats":{"files":1,"chunks":0,"new_chunks":0,
+            "new_objects":1,"stored_bytes":10,"world_bytes":10},
+            "files":[{"kind":"blob","path":"level.dat","size":10,
+            "hash":"0000000000000000000000000000000000000000000000000000000000000000"}]}"#;
+        let mut snap: Snapshot = serde_json::from_str(json).unwrap();
+        snap.upgrade();
+        assert_eq!(snap.header.world_names, ["world"]);
+        assert_eq!(snap.worlds.len(), 1);
+        assert_eq!(snap.worlds[0].path, ".");
+        assert_eq!(snap.worlds[0].files.len(), 1);
+        assert!(snap.files.is_empty());
+        let mut h: SnapshotHeader = serde_json::from_str(json).unwrap();
+        h.upgrade();
+        assert_eq!(h.world_names, ["world"]);
     }
 }

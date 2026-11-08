@@ -34,9 +34,9 @@ cargo install --path .
 | command | what it does |
 |---|---|
 | `init <path> [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: level 6, 16 MiB packs) |
-| `backup <world> [-m msg]` | snapshot a world; only new/changed chunks are stored |
-| `list` | snapshots, newest first, with what each one added |
-| `restore <id> <folder> [--force \| --force-wipe]` | rebuild a snapshot into a new or empty folder, or over an existing world (see below) |
+| `backup <folder> [-w world]… [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
+| `list` | snapshots, newest first, with what each one added and which worlds it holds |
+| `restore <id> <folder> [-w world] [--force \| --force-wipe]` | rebuild a snapshot (or one world of it) into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
 | `compare <a> <b>` | compare two world folders chunk by chunk (e.g. original vs restored) and check `b`'s region files are laid out so Minecraft can read them |
 | `prune [--keep-last N] [--dry-run]` | drop old snapshots, delete/compact packs holding data nothing references |
@@ -73,28 +73,55 @@ save-on
 
 (Over RCON, e.g. with `mcrcon`.) If a file changes while vxl reads it, vxl warns you.
 
-### Paper / Spigot / Bukkit servers
+## Whole servers
 
-Unlike vanilla, these keep each dimension in **its own folder** next to `world`:
+Point `backup` at the server folder and every world in it goes into **one snapshot**:
 
+```console
+$ vxl backup ~/server -m nightly
+worlds: world, world_nether, world_the_end
+snapshot 8c41d0 | 131,052 chunks | 2,311 new | +41.7 MB stored (1.9s)
 ```
-server/
-  world/            overworld
-  world_nether/     the Nether (DIM-1 inside)
-  world_the_end/    the End (DIM1 inside)
-```
 
-Backing up only `world` misses the Nether and the End. Back up all three into the same
-repository (they share dedup and pruning):
+A world is a folder with a `level.dat`, found up to two levels down (`world/`, or
+`worlds/lobby/` with Paper's `--world-container`). Everything inside a world belongs to it,
+so vanilla/Fabric/Forge dimensions (`world/DIM-1`, `world/dimensions/<mod>/…`) come along
+with `world`, while Paper's separate `world_nether` / `world_the_end` and Multiverse worlds
+are worlds of their own. `plugins/`, `mods/`, `config/`, `backups/`, `logs/` and similar
+folders are never searched, so a backup plugin's world copies aren't picked up. Symlinked
+worlds are followed.
+
+**Only worlds are backed up.** Plugin data (claims, permissions, economy), configs and jars
+are not. Back those up with an ordinary file backup.
+
+Pick worlds with `-w` / `--world` (repeatable):
+
+| `-w` | backs up |
+|---|---|
+| *(none)* or `'*'` | every world found |
+| `world -w world_nether` | exactly these (by folder name) |
+| `worlds/lobby` | the world at that path under the server folder |
+| `'*' -w '!creative'` | all but `creative` |
+
+Two selected worlds with the same folder name (`a/world1`, `b/world1`) are an error; select
+one by its path.
+
+Restoring a server snapshot puts each world back where it was (`<folder>/world_nether`,
+`<folder>/worlds/lobby`, …) and writes nothing else, so `vxl restore <id> ~/server --force-wipe`
+rolls every world back in place and leaves plugins and configs alone. If any world fails to
+rebuild, none of them is touched. `-w <name>` restores a single world into `<folder>` itself,
+as a standalone world folder you can load or hand to someone:
 
 ```bash
-vxl backup ~/server/world         --repo ~/vxl-repo -m "overworld nightly"
-vxl backup ~/server/world_nether  --repo ~/vxl-repo -m "nether nightly"
-vxl backup ~/server/world_the_end --repo ~/vxl-repo -m "end nightly"
+vxl restore 8c41d0 ~/nether-copy -w world_nether
 ```
 
-That makes three snapshots per night, so `prune --keep-last N` keeps about N/3 nights.
-One-snapshot whole-server backups are planned (see [ROADMAP.md](ROADMAP.md)).
+Player data (inventories, positions, stats, advancements) lives only in the main world
+(`world/playerdata/` etc.), so restoring just `world_nether` rolls back the Nether's blocks
+but not anyone's inventory.
+
+Backing up a single world folder (`vxl backup ~/server/world`) still works and restores as
+that world folder, like before.
 
 To test a restore, start a throwaway copy of the server (same Paper version and plugins,
 different `server-port`) on the restored folders. Opening a Paper world in vanilla
@@ -126,8 +153,10 @@ repo/
   content share storage, however Minecraft compressed them.
 - **Everything else** (`level.dat`, `playerdata/`, `data/`, …) is stored as a whole-file
   object. `session.lock` is skipped.
-- **The manifest** lists every file, and for region files every chunk's slot, timestamp,
-  original compression and object hash. Its own hash is the snapshot id.
+- **The manifest** lists the snapshot's worlds and, for each, every file, and for region
+  files every chunk's slot, timestamp, original compression and object hash. Its own hash
+  is the snapshot id. All worlds share one object store, so content that is identical across
+  worlds (a copied arena or lobby) is stored once.
 - **Crash safety**: packs are built in memory, written to `tmp/`, fsynced and renamed into
   place; the manifest is written last, after the final pack. A backup that dies halfway
   leaves no snapshot, only packs nobody references, which the next `prune` removes.
