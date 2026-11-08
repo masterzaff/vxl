@@ -157,9 +157,10 @@ Steps:
   mutation tests (`tests/robustness.rs`: flips, extreme lengths, truncation, splices, hostile
   nesting) run with every `cargo test`; they found an overflow in the pack-index bounds check
   (fixed). Still open: coverage-guided `cargo-fuzz` targets (needs nightly).
-- **Big-repo speed.** ✅ Snapshot headers are cached (`cache/headers/`), so `list` and
-  `prune` don't decompress whole manifests. Still open: a combined pack-index cache, so
-  `open` reads one file instead of every pack's index once there are thousands of packs.
+- ✅ **Big-repo speed.** Snapshot headers are cached (`cache/headers/`), so `list` and
+  `prune` don't decompress whole manifests, and all pack indexes are cached in one
+  checksummed file (`cache/packs.idx`), checked against the pack files on every open, so
+  `open` reads one file instead of seeking into thousands of packs.
 - **Close the untested paths:** an LZ4 world, real use on Windows.
 - **Releases.** ✅ `.github/workflows/release.yml`: a `v*` tag builds, tests and attaches
   static x86_64 Linux (musl), arm64 macOS and x86_64 Windows binaries plus `SHA256SUMS`;

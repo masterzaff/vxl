@@ -18,6 +18,7 @@ pub mod anvil;
 pub mod commands;
 pub mod config;
 pub mod hooks;
+pub mod index_cache;
 pub mod manifest;
 pub mod nbt;
 pub mod pack;

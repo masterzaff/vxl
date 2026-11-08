@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::index_cache;
 use crate::manifest::{Snapshot, SnapshotHeader};
 use crate::pack::{self, Builder, Entry};
 use crate::util::{atomic_write, sync_dir};
@@ -240,10 +241,18 @@ impl Repo {
         Ok(repo)
     }
 
+    /// Load every pack's index, from `cache/packs.idx` where it's still valid (see
+    /// [`index_cache`]); packs the cache doesn't know are read, and the cache is rewritten
+    /// if anything changed (best effort: a read-only repo just doesn't get one).
     fn load_index(&mut self) -> Result<()> {
+        let cache_path = self.root.join("cache").join("packs.idx");
+        let mut cached = index_cache::read(&cache_path).unwrap_or_default();
+        let had = cached.len();
         let mut index = Index::default();
+        let mut changed = false;
         for e in fs::read_dir(self.root.join("packs"))? {
-            let path = e?.path();
+            let e = e?;
+            let path = e.path();
             let Some(id) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -252,10 +261,23 @@ impl Repo {
             else {
                 continue;
             };
+            let size = e.metadata()?.len();
+            if let Some((cached_size, entries)) = cached.remove(&id)
+                && cached_size == size
+            {
+                index.add(PackInfo { id, size, entries });
+                continue;
+            }
+            changed = true;
             match pack::read_index(&path) {
                 Ok((size, entries)) => index.add(PackInfo { id, size, entries }),
                 Err(e) => self.warnings.push(format!("ignoring unreadable pack {}: {e:#}", path.display())),
             }
+        }
+        // Whatever is left in `cached` is for packs that no longer exist.
+        if changed || !cached.is_empty() || had != index.packs.len() {
+            let packs = index.packs.values().map(|p| (&p.id, p.size, p.entries.as_slice()));
+            let _ = index_cache::write(&cache_path, &self.tmp_dir(), packs);
         }
         self.index = RwLock::new(index);
         Ok(())
@@ -737,5 +759,56 @@ mod tests {
         repo.delete_snapshot(&id).unwrap();
         assert!(!cache.exists());
         assert!(repo.load_header(&id).is_err());
+    }
+
+    #[test]
+    fn pack_index_cache_follows_the_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        Repo::init(dir.path(), 3, 64 << 10).unwrap();
+        let cache = dir.path().join("cache/packs.idx");
+        let blobs: Vec<Vec<u8>> = (0..40).map(|i| noise(i, 20_000)).collect();
+        {
+            let repo = Repo::open(dir.path(), LockMode::Exclusive).unwrap();
+            for b in &blobs {
+                repo.put(b).unwrap();
+            }
+            repo.flush().unwrap();
+        }
+        assert!(!cache.exists(), "nothing to cache before the first open with packs");
+        let ids = {
+            let repo = Repo::open(dir.path(), LockMode::Shared).unwrap();
+            repo.list_objects()
+        };
+        assert!(cache.exists());
+        let packs: Vec<PathBuf> =
+            fs::read_dir(dir.path().join("packs")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert!(packs.len() > 1);
+
+        // Served from the cache: a pack whose index area is damaged afterwards still opens
+        // cleanly and every object still reads (and hash-checks).
+        let mut bytes = fs::read(&packs[0]).unwrap();
+        let n = bytes.len();
+        bytes[n - 10] ^= 0xFF;
+        fs::write(&packs[0], &bytes).unwrap();
+        let repo = Repo::open(dir.path(), LockMode::Shared).unwrap();
+        assert!(repo.warnings.is_empty(), "{:?}", repo.warnings);
+        assert_eq!(repo.list_objects().len(), ids.len());
+        for b in &blobs {
+            assert_eq!(&repo.get(&ObjectId::of(b)).unwrap(), b);
+        }
+        drop(repo);
+        bytes[n - 10] ^= 0xFF;
+        fs::write(&packs[0], &bytes).unwrap();
+
+        // A pack that disappears is dropped from the cache; a corrupt cache is ignored.
+        fs::remove_file(&packs[1]).unwrap();
+        let fewer = Repo::open(dir.path(), LockMode::Shared).unwrap().list_objects().len();
+        assert!(fewer < ids.len());
+        let cached = index_cache::read(&cache).unwrap();
+        assert_eq!(cached.len(), packs.len() - 1);
+        fs::write(&cache, b"garbage").unwrap();
+        let repo = Repo::open(dir.path(), LockMode::Shared).unwrap();
+        assert_eq!(repo.list_objects().len(), fewer);
+        assert!(index_cache::read(&cache).is_some(), "rewritten");
     }
 }

@@ -343,6 +343,7 @@ repo/
   packs/<id>.pack           ~16 MiB files of zstd-compressed objects, each with its own index
   snapshots/<id>.json.zst   one manifest per snapshot
   cache/headers/<id>.json   snapshot headers, so `list` and `prune` don't read whole manifests
+  cache/packs.idx           every pack's index in one file, so opening reads one file, not every pack
   tmp/                      staging for atomic writes
 ```
 
@@ -452,8 +453,10 @@ byte-identical; zero fallbacks.
   million distinct chunks across all snapshots.
 - Repositories made by the first development build (loose object files, format v1)
   can't be opened; create a new one.
-- `list` and `prune` read snapshot headers from a cache (`cache/headers/`); the first time
-  after upgrading, they read every manifest once to fill it.
+- `list` and `prune` read snapshot headers from a cache (`cache/headers/`), and opening a
+  repo reads pack indexes from `cache/packs.idx`; the first time after upgrading, vxl reads
+  every manifest and pack index once to fill them. Both caches are checked against the files
+  that exist and can be deleted at any time.
 
 ## Code map (for reading the source)
 
