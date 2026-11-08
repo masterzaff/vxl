@@ -7,7 +7,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use vxl::commands::{backup, compare, list, prune, restore, verify};
+use vxl::commands::{backup, compare, diff, list, prune, restore, verify};
 use vxl::config::Config;
 use vxl::hooks::{self, Hooks};
 use vxl::repo::{self, LockMode, Repo};
@@ -124,6 +124,20 @@ enum Cmd {
     },
     /// List snapshots, newest first.
     List {
+        #[command(flatten)]
+        repo: RepoArg,
+    },
+    /// What changed between two snapshots, per world and dimension, without restoring.
+    /// Chunks compare by content, so a chunk that was only re-saved doesn't count.
+    Diff {
+        /// The older snapshot: an id, `latest` or a time (see `restore`).
+        a: String,
+        /// The newer snapshot (default: latest).
+        #[arg(default_value = "latest")]
+        b: String,
+        /// Also list every changed file.
+        #[arg(long)]
+        files: bool,
         #[command(flatten)]
         repo: RepoArg,
     },
@@ -370,6 +384,51 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     human_bytes(h.stats.stored_bytes),
                     h.world_names.join(", "),
                 );
+            }
+        }
+
+        Cmd::Diff { a, b, files, repo } => {
+            let repo = open(&repo, &cfg, LockMode::None)?;
+            let (ia, ib) = (list::resolve(&repo, &a)?, list::resolve(&repo, &b)?);
+            let (sa, sb) = (repo.load_snapshot(&ia)?, repo.load_snapshot(&ib)?);
+            println!("{} → {}", short(&ia, 6), short(&ib, 6));
+            let counts = |c: &diff::Counts| {
+                let mut parts = vec![];
+                for (n, what) in [(c.changed, "changed"), (c.added, "added"), (c.removed, "removed")] {
+                    if n > 0 {
+                        parts.push(format!("{} {what}", thousands(n)));
+                    }
+                }
+                if parts.is_empty() { "no chunk changes".to_string() } else { parts.join(", ") }
+            };
+            for w in diff::diff(&sa, &sb) {
+                match w.only_in {
+                    Some(diff::Side::A) => println!("{}: only in {}", w.name, short(&ia, 6)),
+                    Some(diff::Side::B) => println!("{}: only in {}", w.name, short(&ib, 6)),
+                    None if w.is_same() => println!("{}: unchanged", w.name),
+                    None => {
+                        let other = match w.other_files() {
+                            0 => String::new(),
+                            n => format!(" | {n} other file{} changed", if n == 1 { "" } else { "s" }),
+                        };
+                        println!("{}: chunks {}{other}", w.name, counts(&w.chunks()));
+                        for (dim, c) in &w.dimensions {
+                            println!("  {dim}: {}", counts(c));
+                        }
+                    }
+                }
+                if files && w.only_in.is_none() {
+                    for f in &w.files {
+                        let mark = match f.change {
+                            diff::Change::Added => 'A',
+                            diff::Change::Removed => 'D',
+                            diff::Change::Changed => 'M',
+                        };
+                        let detail =
+                            f.chunks.as_ref().map(|c| format!(" ({})", counts(c))).unwrap_or_default();
+                        println!("    {mark} {}{detail}", f.path);
+                    }
+                }
             }
         }
 

@@ -938,3 +938,41 @@ fn cli_show_and_snapshot_by_time() {
     assert!(ok, "{err}");
     assert!(target.join("level.dat").exists());
 }
+
+#[test]
+fn cli_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = tmp.path().join("server");
+    let repo = tmp.path().join("repo");
+    synth::write_world(&s.join("world"), 95, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("world_nether"), 96, &[(0, 0)], 5, Compression::Zlib, |_, _| 0).unwrap();
+    let vxl = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_vxl")).args(args).env("VXL_REPO", &repo).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    vxl(&["init", repo.to_str().unwrap()]);
+    let first =
+        vxl(&["backup", s.to_str().unwrap()]).lines().nth(1).unwrap()["snapshot ".len()..][..6].to_string();
+
+    // Play: 3 chunks edited in the overworld, a new End region inside `world`; the nether untouched.
+    let edit = |cx: i32, cz: i32| if cz == 0 && (0..3).contains(&cx) { 4 } else { 0 };
+    synth::write_world(&s.join("world"), 95, &[(0, 0)], 20, Compression::Zlib, edit).unwrap();
+    let end = [RawChunk {
+        slot: 0,
+        timestamp: 1,
+        compression: 2,
+        external: false,
+        payload: anvil::compress(Compression::Zlib, &synth::chunk_nbt(97, 0, 0, 0)).unwrap(),
+    }];
+    write_region(&s.join("world/DIM1/region/r.0.0.mca"), (0, 0), &end);
+    vxl(&["backup", s.to_str().unwrap()]);
+
+    let out = vxl(&["diff", &first]);
+    assert!(out.contains("world: chunks 3 changed, 1 added | 1 other file changed"), "{out}"); // playerdata
+    assert!(out.contains("  overworld: 3 changed\n") && out.contains("  the_end: 1 added\n"), "{out}");
+    assert!(out.contains("world_nether: unchanged"), "{out}");
+    let out = vxl(&["diff", &first, "latest", "--files"]);
+    assert!(out.contains("    M region/r.0.0.mca (3 changed)"), "{out}");
+    assert!(out.contains("    A DIM1/region/r.0.0.mca (1 added)"), "{out}");
+}

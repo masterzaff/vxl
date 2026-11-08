@@ -3,6 +3,7 @@
 
 pub mod backup;
 pub mod compare;
+pub mod diff;
 pub mod list;
 pub mod prune;
 pub mod restore;

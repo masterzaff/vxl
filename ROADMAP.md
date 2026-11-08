@@ -113,8 +113,9 @@ snapshot, and a restore of it loads cleanly:
    coordinates) into a stopped live world. Must bring the matching `entities/` and `poi/`
    chunks along: since 1.17 entities live in separate files, and restoring blocks without
    them leaves mobs and item frames wrong.
-2. **`vxl diff <a> <b>`** between snapshots, without restoring: which dimensions, regions
-   and chunks changed. (`vxl compare` already does this for two folders.)
+2. ✅ **`vxl diff <a> [b]`** between snapshots, without restoring: per world and dimension,
+   chunks changed/added/removed by content, other files changed; `--files` lists every file.
+   (`vxl compare` does this for two folders.)
 3. ✅ **`vxl show <id>`** for snapshot details. Every command that takes a snapshot also
    takes `latest` or a time (`vxl restore "2026-11-07 03:00" …`): the newest snapshot *at or
    before* it (not the nearest: a rollback should never pick a snapshot from after the
