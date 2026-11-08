@@ -90,12 +90,16 @@ fn main() {
         rows.push((level, size, mbps(raw, best_c)));
     }
 
-    // The knee: of the levels that still compress at >= 25% of level 1's speed,
-    // take the smallest one that gets within 1% of the best size among them.
-    let fast = rows.iter().find(|r| r.0 == 1).unwrap().2;
-    let ok: Vec<_> = rows.iter().filter(|r| r.0 >= 1 && r.2 >= fast * 0.25).collect();
-    let best = ok.iter().map(|r| r.1).min().unwrap();
-    let pick = ok.iter().find(|r| r.1 as f64 <= best as f64 * 1.01).unwrap();
+    // The knee: the last level in 1..=12 where going up one level still shrinks
+    // the output by at least 2%. Past that, each level costs speed for crumbs.
+    // (Based on size steps only, so it doesn't flip on noisy speed measurements.)
+    let mid: Vec<_> = rows.iter().filter(|r| (1..=12).contains(&r.0)).collect();
+    let pick = mid
+        .windows(2)
+        .rev()
+        .find(|w| (w[1].1 as f64) <= w[0].1 as f64 * 0.98)
+        .map(|w| w[1])
+        .unwrap_or(mid[0]);
     println!("\nsweet spot: level {} ({:.0} MB/s single-threaded)", pick.0, pick.2);
 
     // How much would a trained dictionary add? (not used by vxl yet)

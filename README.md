@@ -73,6 +73,33 @@ save-on
 
 (Over RCON, e.g. with `mcrcon`.) If a file changes while vxl reads it, vxl warns you.
 
+### Paper / Spigot / Bukkit servers
+
+Unlike vanilla, these keep each dimension in **its own folder** next to `world`:
+
+```
+server/
+  world/            overworld
+  world_nether/     the Nether (DIM-1 inside)
+  world_the_end/    the End (DIM1 inside)
+```
+
+Backing up only `world` misses the Nether and the End. Back up all three into the same
+repository (they share dedup and pruning):
+
+```bash
+vxl backup ~/server/world         --repo ~/vxl-repo -m "overworld nightly"
+vxl backup ~/server/world_nether  --repo ~/vxl-repo -m "nether nightly"
+vxl backup ~/server/world_the_end --repo ~/vxl-repo -m "end nightly"
+```
+
+That makes three snapshots per night, so `prune --keep-last N` keeps about N/3 nights.
+One-snapshot whole-server backups are planned (see [ROADMAP.md](ROADMAP.md)).
+
+To test a restore, start a throwaway copy of the server (same Paper version and plugins,
+different `server-port`) on the restored folders. Opening a Paper world in vanilla
+singleplayer can fail on data packs even when the world itself is fine.
+
 ## How it works
 
 ```
@@ -141,7 +168,9 @@ On synthetic terrain (1,600 chunks, single thread):
 | 19 | 88.5% | 6 |
 
 Level 6 is the knee. Going up to 19 saves another ~10% but is ~25× slower, and decompression
-speed is about the same at every level. Chunks deduplicate across snapshots, so
+speed is about the same at every level. A real survival world (2,986 sampled chunks, avg
+29 KB raw) showed the same shape: level 6 at 97.4% of zlib's size, levels 6–12 within 1.5%
+of each other, level 19 at 88.1% but 40× slower. Chunks deduplicate across snapshots, so
 the level matters less over time than it might seem. Run it on your own world to check;
 `vxl init --zstd-level N` overrides the default (it's fixed per repository).
 
