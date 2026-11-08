@@ -446,6 +446,20 @@ object, which brings the first backup down to +14%. Most of what's left is proba
 Splitting runs ~3.3× slower than storing chunks whole. Every transformed chunk was verified
 byte-identical; zero fallbacks.
 
+**Compact references** fix that: inside a grouped object, a skeleton refers to its new
+sections as "#n in this object" and to older ones by a sequential id instead of a hash.
+On the real Paper world (6 consecutive nightly copies, then one 3 months later):
+
+| method | 1st backup | avg night | 6 nights total | + 3-month gap |
+|---|---|---|---|---|
+| whole (today) | 469 MB | 32.4 MB | 631 MB | 790 MB |
+| grouped split | 119% | 43% | 99% | 93% |
+| **grouped + compact** | **100%** | **28%** | **82%** | **76%** |
+| grouped + unpack + compact | 95% | 26% | 77% | 71% |
+
+So the first backup costs nothing extra and every later one is ~3.5× smaller. This is the
+plan for storage format v3 (see [ROADMAP.md](ROADMAP.md)).
+
 ## Known limitations
 
 - Chunks the server has *loaded* get new `LastUpdate`/`InhabitedTime` values in their NBT,

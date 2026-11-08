@@ -255,7 +255,12 @@ fn synthetic_versions() -> Vec<(String, Batches)> {
 fn world_versions(dirs: Vec<PathBuf>) -> Vec<(String, Batches)> {
     dirs.into_iter()
         .map(|dir| {
-            let name = dir.display().to_string();
+            // A copy is usually `<date>/world`: label it by the folder that tells copies apart.
+            let leaf = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+            let name = match leaf(&dir) {
+                Some(n) if n == "world" => dir.parent().and_then(leaf).unwrap_or(n),
+                other => other.unwrap_or_else(|| dir.display().to_string()),
+            };
             let f: Batches = Box::new(move |sink: &mut dyn FnMut(Vec<Vec<u8>>)| {
                 let scan = world::scan(&dir).expect("scan world");
                 for f in scan.files {

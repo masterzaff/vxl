@@ -127,23 +127,36 @@ snapshot, and a restore of it loads cleanly:
 
 *Goal: smaller repos, only with proven gains.*
 
-Real-world results so far (`examples/nbt_bench.rs`, `examples/zstd_levels.rs`, 3 days):
+Measured on the real Paper world: 6 consecutive nightly copies (2026-08-08…13, from the
+restic backups) plus one 3 months later (2026-11-08); `examples/nbt_bench.rs`,
+`examples/zstd_levels.rs`. Zero fallbacks: every transformed chunk decoded byte-identically.
 
-| idea | result on the real world | cost |
-|---|---|---|
-| trained zstd dictionary | −10% on everything | repo-wide dependency that must never be lost |
-| unpack bit-packed arrays | −5% on everything | ~3× slower encoding |
-| grouped split (sub-chunk dedup) | nightly −37…−70%, first backup +14% | complexity in prune/restore |
-| compact section references | expected to remove most of that +14% | not measured yet |
+| method | 1st backup | avg night | 6 nights total | + 3-month gap | MB/s |
+|---|---|---|---|---|---|
+| whole (today) | 469 MB | 32.4 MB | 631 MB | 790 MB | 2590 |
+| unpack | 95% | 96% | 95% | 95% | 795 |
+| grouped split | 119% | 43% | 99% | 93% | 680 |
+| **grouped + compact refs** | **100%** | **28%** | **82%** | **76%** | 661 |
+| grouped + unpack + compact | 95% | 26% | 77% | 71% | 435 |
+
+(One night, 08-10 → 08-11, changed nothing at all: the server sat idle. A trained zstd
+dictionary was measured separately at about −10% on everything.)
 
 Steps:
 
-1. Add compact section references to `nbt_bench` (1-byte "#n in this object" for
-   sections stored alongside, short numeric ids for older ones instead of 32-byte hashes;
-   the 2.57M hashes in the first real backup are ~82 MB on their own).
-2. Rerun on **~7 days** of copies (3 days is too few to judge incremental gains).
-3. **Decision rule:** adopt grouped split only if the 7-day total is clearly below today's
-   **and** the first backup is within ~+5%. Otherwise ship unpack + dictionary alone.
+1. ✅ Compact section references in `nbt_bench`: "#n in this object" for sections stored
+   alongside, a sequential id for older ones, instead of 32-byte hashes.
+2. ✅ Rerun on real copies (above). 6 consecutive nights rather than 7: the restic repo has
+   no dailies between 08-13 and 11-08 (the backups were failing).
+3. ✅ **Decision: adopt grouped split with compact references for format v3.** The rule
+   (total clearly below today's, first backup within ~+5%) holds: the first backup costs
+   +0.04%, the total is −18% over 6 nights and −24% with the long gap, and a typical
+   night is ~3.5× smaller. Unpack adds another −5% at ~35% less throughput and the
+   dictionary ~−10% with a repo-wide dependency; both are independent of the format
+   change and left to measure on top of v3 once it exists.
+   Before building it, the format needs: section objects shared between grouped objects
+   (prune may only drop a grouped object when no live skeleton still points into it),
+   the id → (object, index) table for compact refs, and decode/verify through both.
 4. **`vxl migrate`** v2 → v3 (rewrite packs). Real repos exist now, so unlike v1 this
    needs a proper migration.
 5. Optional: recompress at a higher zstd level during prune (~−10%, costs only prune time).
