@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use rayon::prelude::*;
 
@@ -22,6 +22,8 @@ pub struct PruneReport {
     pub kept_snapshots: usize,
     /// For `prune`: each kept snapshot and the rules that keep it, newest first.
     pub kept_by: Vec<(ObjectId, Vec<Period>)>,
+    /// For `prune`: kept snapshots that are pinned (`vxl pin`), whatever the rules say.
+    pub pinned: HashSet<ObjectId>,
     /// Unreferenced objects removed from disk.
     pub deleted_objects: u64,
     /// Unreferenced objects left in packs that are still mostly in use
@@ -39,18 +41,28 @@ pub struct PruneReport {
 
 /// Drop the snapshots `policy` doesn't keep (an empty policy keeps all), then collect
 /// garbage: delete packs nothing uses, compact packs that are mostly garbage or tiny.
-/// Periods are in local time. Needs the exclusive lock.
+/// Pinned snapshots are always kept. Periods are in local time. Needs the exclusive lock.
 pub fn prune(repo: &Repo, policy: &Policy, dry_run: bool) -> Result<PruneReport> {
     let snaps = list(repo)?; // newest first
+    let pins = repo.pins()?;
     let decisions = retention::apply(policy, &snaps, &Local);
-    let remove: HashSet<ObjectId> = decisions.iter().filter(|d| d.kept_by.is_empty()).map(|d| d.id).collect();
+    let remove: HashSet<ObjectId> = decisions
+        .iter()
+        .filter(|d| d.kept_by.is_empty() && !pins.contains_key(&d.id))
+        .map(|d| d.id)
+        .collect();
     let mut report = collect(repo, &snaps, &remove, dry_run)?;
-    report.kept_by =
-        decisions.into_iter().filter(|d| !d.kept_by.is_empty()).map(|d| (d.id, d.kept_by)).collect();
+    report.pinned = pins.into_keys().collect();
+    report.kept_by = decisions
+        .into_iter()
+        .filter(|d| !d.kept_by.is_empty() || report.pinned.contains(&d.id))
+        .map(|d| (d.id, d.kept_by))
+        .collect();
     Ok(report)
 }
 
-/// Delete exactly these snapshots, then collect garbage like [`prune`].
+/// Delete exactly these snapshots, then collect garbage like [`prune`]. Refuses pinned
+/// ones (unpin them first).
 pub fn delete(repo: &Repo, ids: &[ObjectId], dry_run: bool) -> Result<PruneReport> {
     let snaps = list(repo)?;
     collect(repo, &snaps, &ids.iter().copied().collect(), dry_run)
@@ -84,6 +96,15 @@ fn collect(
     remove: &HashSet<ObjectId>,
     dry_run: bool,
 ) -> Result<PruneReport> {
+    // Read pins here too, so nothing that ends up deleting snapshots can skip them.
+    let pins = repo.pins()?;
+    let mut pinned: Vec<String> =
+        remove.iter().filter(|id| pins.contains_key(id)).map(|id| id.hex()).collect();
+    if !pinned.is_empty() {
+        pinned.sort();
+        let short: Vec<&str> = pinned.iter().map(|h| &h[..6]).collect();
+        bail!("{} pinned; `vxl unpin` first to delete", short.join(", "));
+    }
     let (removed, kept): (Vec<_>, Vec<_>) = snaps.iter().partition(|(id, _)| remove.contains(id));
 
     // Mark. If any kept manifest can't be read we bail out *before* deleting

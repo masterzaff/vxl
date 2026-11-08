@@ -374,6 +374,7 @@ fn back_to_format_2_and_forward_again() {
         let r = backup(&dir, &env.world);
         want.push((r.id, contents(&env.world)));
     }
+    open(&dir).pin(&want[1].0, "keep me").unwrap();
     let r = migrate::migrate(&mut open(&dir), 2, &ProgressBar::hidden()).unwrap();
     assert_eq!(r.snapshots, 4);
     assert_eq!(r.renamed.len(), 4, "manifests with chunk tables get new ids");
@@ -382,6 +383,10 @@ fn back_to_format_2_and_forward_again() {
     assert!(!repo.has_group_objects().unwrap());
     drop(repo);
     let new_id = |old: &ObjectId| r.renamed.iter().find(|(a, _)| a == old).unwrap().1;
+    // The pin moved with its snapshot.
+    let pins = open(&dir).pins().unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[&new_id(&want[1].0)], "keep me");
     for (id, c) in &want {
         assert_eq!(&restored(&env, &dir, &new_id(id)), c);
     }

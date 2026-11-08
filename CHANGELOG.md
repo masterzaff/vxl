@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 (2026-11-09)
+
+- `vxl pin <id> [-m note]`, `vxl unpin <id>` and `backup --pin`: a pinned snapshot is never
+  removed by `prune`, and `delete` refuses it. For keeping one for good, like the last
+  backup before a Minecraft update. `list` and `show` show pins, `prune --dry-run` says
+  "pinned". Pins are kept in `pins/` in the repo and follow a snapshot through
+  `migrate --to 2`. vxl 0.2.0 doesn't know pins, so don't prune such a repo with it.
+- `list` shows each snapshot's world size on disk.
+
 ## 0.2.0 (2026-11-09)
 
 First release. Differential, deduplicating backups for Minecraft Java Edition worlds:

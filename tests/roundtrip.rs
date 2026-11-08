@@ -1187,3 +1187,101 @@ fn partial_restore_with_the_newer_dimensions_layout() {
     assert_eq!(chunks_of(w, nether), nether_now, "other dimension untouched");
     assert_ne!(nether_now, nether_then);
 }
+
+#[test]
+fn pinned_snapshots_survive_prune_and_delete() {
+    let env = setup();
+    let mut ids = vec![];
+    for round in 0..4u32 {
+        let edit = move |cx: i32, _cz: i32| if cx == round as i32 { round + 1 } else { 0 };
+        synth::write_world(&env.world, 72, &[(0, 0)], 40, Compression::Zlib, edit).unwrap();
+        ids.push(do_backup(&env, &format!("round {round}")).id);
+    }
+    let repo = repo(&env);
+    repo.pin(&ids[0], "  before 1.22 \n").unwrap();
+    repo.pin(&ids[1], "").unwrap();
+    let pins = repo.pins().unwrap();
+    assert_eq!(pins.len(), 2);
+    assert_eq!(pins[&ids[0]], "before 1.22");
+    assert_eq!(pins[&ids[1]], "");
+
+    // keep-last 1 keeps the newest and both pinned ones; only round 2 goes.
+    let r = prune::prune(&repo, &keep_last(1), false).unwrap();
+    assert_eq!(r.removed_snapshots, [ids[2]]);
+    assert_eq!(r.kept_snapshots, 3);
+    assert!(r.pinned.contains(&ids[0]) && r.pinned.contains(&ids[1]));
+    assert!(r.kept_by.iter().any(|(id, why)| *id == ids[0] && why.is_empty()));
+    let kept = repo.snapshot_ids().unwrap();
+    assert!(verify::verify(&repo, &kept, &hidden()).unwrap().problems.is_empty());
+    let target = env.base.join("restored");
+    restore::restore(&repo, &ids[0], &target, None, restore::Mode::Fresh, &hidden()).unwrap();
+
+    // delete refuses a pinned one, and nothing at all is deleted then.
+    let e = prune::delete(&repo, &[ids[3], ids[1]], false).unwrap_err().to_string();
+    assert!(e.contains("pinned") && e.contains(&ids[1].hex()[..6]), "{e}");
+    assert_eq!(repo.snapshot_ids().unwrap().len(), 3);
+
+    // Unpinned, the rules apply again; deleting a snapshot takes its pin along.
+    assert!(repo.unpin(&ids[1]).unwrap());
+    assert!(!repo.unpin(&ids[1]).unwrap());
+    assert_eq!(prune::prune(&repo, &keep_last(1), false).unwrap().removed_snapshots, [ids[1]]);
+    repo.unpin(&ids[0]).unwrap();
+    repo.pin(&ids[0], "x").unwrap();
+    assert!(repo.pin(&ids[2], "gone").is_err(), "can't pin a snapshot that doesn't exist");
+    assert!(repo.unpin(&ids[0]).unwrap());
+    prune::delete(&repo, &[ids[0]], false).unwrap();
+    assert!(repo.pins().unwrap().is_empty());
+}
+
+#[test]
+fn cli_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let world = tmp.path().join("world");
+    let repo = tmp.path().join("repo");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vxl")).args(args).env("VXL_REPO", &repo).output().unwrap()
+    };
+    let vxl = |args: &[&str]| {
+        let out = run(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    vxl(&["init", repo.to_str().unwrap()]);
+    let mut ids = vec![];
+    for round in 0..3u32 {
+        let edit = move |cx: i32, _cz: i32| if cx == round as i32 { round + 1 } else { 0 };
+        synth::write_world(&world, 73, &[(0, 0)], 10, Compression::Zlib, edit).unwrap();
+        let mut args = vec!["backup", world.to_str().unwrap()];
+        if round == 1 {
+            args.extend(["--pin", "-m", "the good one"]);
+        }
+        let out = vxl(&args);
+        ids.push(out["snapshot ".len()..][..6].to_string());
+        if round == 1 {
+            assert!(out.contains(&format!("pinned {}", ids[1])), "{out}");
+        }
+    }
+    assert!(vxl(&["pin", &ids[0], "-m", "before 1.22"]).contains(&format!("pinned {}", ids[0])));
+    assert!(vxl(&["pin", &ids[0], "-m", "before 1.22!"]).contains("re-pinned"));
+
+    let listing = vxl(&["list"]);
+    let line = |id: &str| listing.lines().find(|l| l.starts_with(id)).unwrap().to_string();
+    assert!(line(&ids[0]).ends_with("[pinned: before 1.22!]"), "{listing}");
+    assert!(line(&ids[1]).ends_with("[pinned]"), "{listing}");
+    assert!(!line(&ids[2]).contains("pinned"), "{listing}");
+    assert!(line(&ids[2]).contains(" KB"), "world size is listed: {listing}");
+    assert!(vxl(&["show", &ids[0]]).contains("pinned    before 1.22!"));
+
+    let out = vxl(&["prune", "--keep-last", "1", "--dry-run"]);
+    assert!(out.contains(&format!("would keep   {} (pinned)", ids[0])), "{out}");
+    assert!(out.contains("would remove 0 snapshots, kept 3"), "{out}");
+    let bad = run(&["delete", &ids[1]]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("vxl unpin"));
+
+    assert!(vxl(&["unpin", &ids[1]]).contains(&format!("unpinned {}", ids[1])));
+    assert!(vxl(&["unpin", &ids[1]]).contains("wasn't pinned"));
+    let out = vxl(&["prune", "--keep-last", "1"]);
+    assert!(out.contains(&format!("removed snapshot {}", ids[1])), "{out}");
+    assert!(vxl(&["list"]).contains(&ids[0]));
+}

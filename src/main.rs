@@ -128,8 +128,32 @@ enum Cmd {
         /// Note to attach to the snapshot.
         #[arg(long, short)]
         message: Option<String>,
+        /// Pin the new snapshot, so `prune` never removes it (see `vxl pin`).
+        #[arg(long)]
+        pin: bool,
     },
-    /// List snapshots, newest first.
+    /// Keep a snapshot for good: `prune` never removes it, `delete` refuses it.
+    ///
+    /// For example the last backup before a Minecraft update. Pinning a pinned snapshot
+    /// again replaces its note.
+    Pin {
+        /// An id (any unique prefix), `latest`, or a time (see `restore`).
+        snapshot: String,
+        /// Why it's pinned (shown by `list` and `show`).
+        #[arg(long, short)]
+        message: Option<String>,
+        #[command(flatten)]
+        repo: RepoArg,
+    },
+    /// Unpin a snapshot, so retention rules apply to it again.
+    Unpin {
+        /// An id (any unique prefix), `latest`, or a time (see `restore`).
+        snapshot: String,
+        #[command(flatten)]
+        repo: RepoArg,
+    },
+    /// List snapshots, newest first: id, time, message, world size on disk, what the
+    /// snapshot added to the repository, worlds, and the pin if any.
     List {
         #[command(flatten)]
         repo: RepoArg,
@@ -342,7 +366,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             );
         }
 
-        Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post, strict } => {
+        Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post, strict, pin } => {
             // Lock first: if another backup is running, fail before pausing the server.
             let repo = open(&repo_arg, &cfg, LockMode::Exclusive)?;
             let Some(source) = source.or(cfg.source.clone()) else {
@@ -404,15 +428,39 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 human_bytes(s.stored_bytes),
                 start.elapsed().as_secs_f64()
             );
+            if pin {
+                repo.pin(&r.id, "").context("the snapshot was saved, but pinning it failed")?;
+                println!("pinned {}", short(&r.id, 6));
+            }
             if let Some(pe) = out.post_error {
                 eprintln!("error: {pe:#} (the snapshot itself was saved)");
                 return Ok(ExitCode::FAILURE);
             }
         }
 
+        Cmd::Pin { snapshot, message, repo } => {
+            // Exclusive, so a prune that's running can't miss the pin.
+            let repo = open(&repo, &cfg, LockMode::Exclusive)?;
+            let id = list::resolve(&repo, &snapshot)?;
+            let again = repo.pins()?.contains_key(&id);
+            repo.pin(&id, message.as_deref().unwrap_or(""))?;
+            println!("{} {}", if again { "re-pinned" } else { "pinned" }, short(&id, 6));
+        }
+
+        Cmd::Unpin { snapshot, repo } => {
+            let repo = open(&repo, &cfg, LockMode::Exclusive)?;
+            let id = list::resolve(&repo, &snapshot)?;
+            if repo.unpin(&id)? {
+                println!("unpinned {}", short(&id, 6));
+            } else {
+                println!("{} wasn't pinned", short(&id, 6));
+            }
+        }
+
         Cmd::List { repo } => {
             let repo = open(&repo, &cfg, LockMode::None)?;
             let snaps = list::list(&repo)?;
+            let pins = repo.pins()?;
             if snaps.is_empty() {
                 println!("no snapshots yet");
             }
@@ -424,11 +472,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .max()
                 .unwrap_or(0);
             for (id, h) in &snaps {
+                let pin = match pins.get(id).map(String::as_str) {
+                    None => String::new(),
+                    Some("") => "  [pinned]".into(),
+                    Some(note) => format!("  [pinned: {note}]"),
+                };
                 println!(
-                    "{}  {}  {:width$}  +{:<9}  {}",
+                    "{}  {}  {:width$}  {:>8}  +{:<9}  {}{pin}",
                     short(id, len),
                     h.created.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
                     h.message.as_deref().unwrap_or(""),
+                    human_bytes(h.stats.world_bytes),
                     human_bytes(h.stats.stored_bytes),
                     h.world_names.join(", "),
                 );
@@ -489,6 +543,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("created   {}", h.created.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z"));
             if let Some(m) = &h.message {
                 println!("message   {m}");
+            }
+            match repo.pins()?.get(&id).map(String::as_str) {
+                None => {}
+                Some("") => println!("pinned    yes"),
+                Some(note) => println!("pinned    {note}"),
             }
             println!("source    {}", h.source);
             println!("format    {}", h.version);
@@ -630,7 +689,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let r = prune::prune(&repo, &cfg.policy(&keep.policy()), dry_run)?;
             if dry_run {
                 for (id, why) in &r.kept_by {
-                    let why: Vec<&str> = why.iter().map(|p| p.name()).collect();
+                    let mut why: Vec<&str> = why.iter().map(|p| p.name()).collect();
+                    if r.pinned.contains(id) {
+                        why.insert(0, "pinned");
+                    }
                     println!("would keep   {} ({})", short(id, 6), why.join(", "));
                 }
             }

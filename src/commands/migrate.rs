@@ -16,9 +16,10 @@
 //!
 //! **To 2** (the way back), the same steps in reverse: every chunk gets a plain copy, each
 //! is checked, manifests with chunk tables are rewritten with their chunk lists inline
-//! (those snapshots get new ids, since an id is the hash of the manifest), then packs are
-//! rewritten without group objects and tables, and only when none are left is the repo
-//! marked format 2. Until that last step it's a valid format-3 repo, and it can be rerun.
+//! (those snapshots get new ids, since an id is the hash of the manifest; pins move
+//! along), then packs are rewritten without group objects and tables, and only when none
+//! are left is the repo marked format 2. Until that last step it's a valid format-3 repo,
+//! and it can be rerun.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -193,6 +194,7 @@ fn to_plain(repo: &mut Repo, progress: &ProgressBar) -> Result<MigrateReport> {
     // 3. Manifests with chunk tables get their chunk lists back inline.
     check_interrupted()?;
     let mut live = HashSet::new();
+    let pins = repo.pins()?;
     for (id, mut snap) in snaps {
         let tabled = snap
             .worlds
@@ -208,6 +210,10 @@ fn to_plain(repo: &mut Repo, progress: &ProgressBar) -> Result<MigrateReport> {
             snap.header.version = 2;
             let new = repo.write_snapshot(&snap)?;
             if new != id {
+                // The pin moves with the snapshot (before the old one, and its pin, go).
+                if let Some(note) = pins.get(&id) {
+                    repo.pin(&new, note)?;
+                }
                 repo.delete_snapshot(&id)?;
                 report.renamed.push((id, new));
             }

@@ -45,15 +45,16 @@ cargo install --path .
 |---|---|
 | `init [path] [--format 2\|3] [--zstd-level N] [--pack-size-mb N]` | create an empty repository at `path` or wherever `--repo`/`VXL_REPO`/`vxl.toml` say (defaults: format 3, level 6, 16 MiB packs; see [storage formats](#storage-formats)) |
 | `migrate [--to 2\|3]` | convert a repository to another storage format (default 3) |
-| `backup [folder] [-w world]… [--pre cmd] [--post cmd] [--strict] [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
-| `list` | snapshots, newest first, with what each one added and which worlds it holds |
+| `backup [folder] [-w world]… [--pre cmd] [--post cmd] [--strict] [-m msg] [--pin]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
+| `list` | snapshots, newest first, with world size, what each one added, which worlds it holds and pins |
 | `show <snapshot>` | one snapshot in detail: its worlds, files, chunks and sizes |
 | `diff <a> [b] [--files]` | what changed from snapshot `a` to `b` (default: latest), per world and dimension, without restoring; chunks compare by content |
 | `restore <id> <folder> [-w world] [--force \| --force-wipe] [--dimension d] [--area x1,z1..x2,z2]` | rebuild a snapshot (or one world, dimension or area of it) into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
 | `compare <a> <b>` | compare two world folders chunk by chunk (e.g. original vs restored) and check `b`'s region files are laid out so Minecraft can read them |
 | `prune [--keep-last/hourly/daily/weekly/monthly/yearly N]… [--dry-run]` | drop snapshots no rule keeps, delete/compact packs holding data nothing references (see below) |
-| `delete <id>… [--dry-run]` | drop exactly these snapshots and collect the data only they used |
+| `delete <id>… [--dry-run]` | drop exactly these snapshots and collect the data only they used (refuses pinned ones) |
+| `pin <id> [-m note]` / `unpin <id>` | keep a snapshot for good: `prune` never removes it, `delete` refuses it |
 
 Wherever a snapshot is expected you can give its id, shortened to any unique prefix like
 git; `latest`; or a local time, for the newest snapshot at or before it:
@@ -150,6 +151,20 @@ would keep   a91e07 (daily)
 …
 would remove snapshot 5c0d22
 ```
+
+Retention is rolling, so no snapshot stays forever on its own. To keep one for good, like
+the last one before a Minecraft update, pin it:
+
+```console
+$ vxl backup --pin -m "before 1.22"      # or later: vxl pin <id> -m "before 1.22"
+$ vxl list
+d4942b  2026-11-09 03:17  before 1.22    1.4 GB  +0 B       world  [pinned]
+$ vxl unpin d4942b                        # back under the --keep rules
+```
+
+A pinned snapshot still takes up a slot a rule would give it (it isn't kept *instead* of
+anything). Pins are files in the repo, so vxl 0.2.0 and older don't know them: don't prune
+a repo with pins using an older vxl.
 
 ## Restoring over an existing world
 
@@ -341,9 +356,10 @@ singleplayer can fail on data packs even when the world itself is fine.
 ```
 repo/
   config.json               format version, zstd level, pack size
-  lock                      OS file lock: backup/prune are exclusive, restore/verify shared
+  lock                      OS file lock: backup/prune/pin are exclusive, restore/verify shared
   packs/<id>.pack           ~16 MiB files of zstd-compressed objects, each with its own index
   snapshots/<id>.json.zst   one manifest per snapshot
+  pins/<id>                 one per pinned snapshot, holding its note
   cache/headers/<id>.json   snapshot headers, so `list` and `prune` don't read whole manifests
   cache/packs.idx           every pack's index in one file, so opening reads one file, not every pack
   tmp/                      staging for atomic writes

@@ -898,7 +898,65 @@ impl Repo {
     pub fn delete_snapshot(&self, id: &ObjectId) -> Result<()> {
         fs::remove_file(self.snapshot_path(id))?;
         let _ = fs::remove_file(self.header_cache_path(id));
+        // A pin of a snapshot that's gone means nothing; callers refuse to delete pinned
+        // snapshots before they get here (or move the pin, like `migrate`).
+        let _ = fs::remove_file(self.pin_path(id));
         Ok(())
+    }
+
+    // -- pins ----------------------------------------------------------------
+    //
+    // A pinned snapshot is never removed by `prune` or `delete`. A pin can't live in the
+    // manifest (the id is its hash), so each is a file `pins/<id>` holding its note.
+    // The folder is created on first use; repos made before pins simply have none.
+
+    fn pin_path(&self, id: &ObjectId) -> PathBuf {
+        self.root.join("pins").join(id.hex())
+    }
+
+    /// Pinned snapshots and their notes. Pins whose snapshot is gone are left out.
+    pub fn pins(&self) -> Result<HashMap<ObjectId, String>> {
+        let mut out = HashMap::new();
+        let dir = self.root.join("pins");
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        for e in entries {
+            let e = e?;
+            let Some(id) = e.file_name().to_str().and_then(|n| ObjectId::from_hex(n).ok()) else { continue };
+            if !self.snapshot_path(&id).exists() {
+                continue;
+            }
+            // A pin that can't be read is still a pin: never let it drop protection.
+            let note = fs::read(e.path()).map(|b| String::from_utf8_lossy(&b).trim().to_string());
+            out.insert(id, note.unwrap_or_default());
+        }
+        Ok(out)
+    }
+
+    /// Pin `id` (replacing the note if it was pinned already).
+    pub fn pin(&self, id: &ObjectId, note: &str) -> Result<()> {
+        if !self.snapshot_path(id).exists() {
+            bail!("snapshot {id} not found");
+        }
+        let dir = self.root.join("pins");
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        atomic_write(&self.pin_path(id), &self.tmp_dir(), note.trim().as_bytes())?;
+        sync_dir(&dir)
+    }
+
+    /// Unpin `id`. `false` if it wasn't pinned.
+    pub fn unpin(&self, id: &ObjectId) -> Result<bool> {
+        match fs::remove_file(self.pin_path(id)) {
+            Ok(()) => {
+                sync_dir(&self.root.join("pins"))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Resolve a (possibly abbreviated) snapshot id, git-style.
