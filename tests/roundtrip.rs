@@ -896,3 +896,45 @@ last = 1
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("no repository given"));
 }
+
+#[test]
+fn cli_show_and_snapshot_by_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = tmp.path().join("server");
+    let repo = tmp.path().join("repo");
+    synth::write_world(&s.join("world"), 90, &[(0, 0)], 12, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("worlds/lobby"), 91, &[(0, 0)], 3, Compression::Zlib, |_, _| 0).unwrap();
+    let vxl = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_vxl")).args(args).env("VXL_REPO", &repo).output().unwrap();
+        (out.status.success(), String::from_utf8(out.stdout).unwrap(), String::from_utf8(out.stderr).unwrap())
+    };
+    vxl(&["init", repo.to_str().unwrap()]);
+    let (ok, out, err) = vxl(&["backup", s.to_str().unwrap(), "-m", "first"]);
+    assert!(ok, "{err}");
+    let first = out.lines().nth(1).unwrap()["snapshot ".len()..][..6].to_string();
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // distinct timestamps
+    let (_, out, _) = vxl(&["backup", s.to_str().unwrap(), "-w", "lobby", "-m", "second"]);
+    let second = out.lines().nth(1).unwrap()["snapshot ".len()..][..6].to_string();
+
+    let (ok, out, err) = vxl(&["show", "latest"]);
+    assert!(ok, "{err}");
+    assert!(out.contains(&second) && out.contains("message   second"), "{out}");
+    let (_, out, _) = vxl(&["show", &first]);
+    let lobby = out.lines().find(|l| l.trim_start().starts_with("lobby")).unwrap();
+    assert!(lobby.contains("worlds/lobby") && lobby.contains(" 3 "), "{out}");
+    assert!(out.lines().any(|l| l.trim_start().starts_with("total") && l.contains(" 15 ")), "{out}");
+
+    // A time picks the newest snapshot at or before it; a date far in the past finds nothing.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let (_, out, _) = vxl(&["show", &today]);
+    assert!(out.contains(&second), "{out}");
+    let (ok, _, err) = vxl(&["show", "2001-01-01"]);
+    assert!(!ok && err.contains("no snapshot at or before"), "{err}");
+    let (ok, _, err) = vxl(&["show", "next-tuesday"]);
+    assert!(!ok && err.contains("neither a snapshot id nor a time"), "{err}");
+
+    let target = tmp.path().join("r");
+    let (ok, _, err) = vxl(&["restore", "latest", target.to_str().unwrap(), "-w", "lobby"]);
+    assert!(ok, "{err}");
+    assert!(target.join("level.dat").exists());
+}

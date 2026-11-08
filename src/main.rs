@@ -127,6 +127,13 @@ enum Cmd {
         #[command(flatten)]
         repo: RepoArg,
     },
+    /// Show one snapshot in detail: its worlds and what each holds.
+    Show {
+        /// An id (any unique prefix), `latest`, or a time (see `restore`).
+        snapshot: String,
+        #[command(flatten)]
+        repo: RepoArg,
+    },
     /// Rebuild a snapshot into a new folder (never touches the live world).
     ///
     /// A snapshot of one world folder restores as that world folder. A snapshot of a server
@@ -134,7 +141,8 @@ enum Cmd {
     /// TARGET/worlds/lobby, …) and nothing else. With --world, just that world is restored,
     /// into TARGET itself.
     Restore {
-        /// Snapshot id (any unique prefix).
+        /// Snapshot: an id (any unique prefix), `latest`, or a time (`2026-11-07`,
+        /// "2026-11-07 03:00") for the newest snapshot at or before it.
         snapshot: String,
         /// Folder to restore into. Each world folder in it must not exist or be empty unless
         /// --force/--force-wipe.
@@ -168,7 +176,7 @@ enum Cmd {
     },
     /// Delete specific snapshots and garbage-collect what only they used.
     Delete {
-        /// Snapshot ids (any unique prefix).
+        /// Snapshots: ids (any unique prefix), `latest`, or times (see `restore`).
         #[arg(required = true)]
         snapshots: Vec<String>,
         /// Show what would be deleted without deleting anything.
@@ -179,7 +187,7 @@ enum Cmd {
     },
     /// Check that every object a snapshot needs is present and intact.
     Verify {
-        /// Snapshot id to check (default: all snapshots).
+        /// Snapshot to check: an id, `latest` or a time (default: all snapshots).
         snapshot: Option<String>,
         #[command(flatten)]
         repo: RepoArg,
@@ -365,9 +373,82 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
 
+        Cmd::Show { snapshot, repo } => {
+            let repo = open(&repo, &cfg, LockMode::None)?;
+            let id = list::resolve(&repo, &snapshot)?;
+            let snap = repo.load_snapshot(&id)?;
+            let h = &snap.header;
+            println!("snapshot  {}", id.hex());
+            println!("created   {}", h.created.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %Z"));
+            if let Some(m) = &h.message {
+                println!("message   {m}");
+            }
+            println!("source    {}", h.source);
+            println!("format    {}", h.version);
+            let rows: Vec<[String; 6]> = snap
+                .worlds
+                .iter()
+                .map(|w| {
+                    [
+                        w.name.clone(),
+                        w.path.clone(),
+                        thousands(w.stats.files),
+                        thousands(w.stats.chunks),
+                        human_bytes(w.stats.world_bytes),
+                        format!("+{}", human_bytes(w.stats.stored_bytes)),
+                    ]
+                })
+                .chain(std::iter::once([
+                    "total".into(),
+                    String::new(),
+                    thousands(h.stats.files),
+                    thousands(h.stats.chunks),
+                    human_bytes(h.stats.world_bytes),
+                    format!("+{}", human_bytes(h.stats.stored_bytes)),
+                ]))
+                .collect();
+            let head = ["world", "path", "files", "chunks", "on disk", "added"];
+            let width =
+                |i: usize| rows.iter().map(|r| r[i].chars().count()).chain([head[i].len()]).max().unwrap();
+            let w: Vec<usize> = (0..6).map(width).collect();
+            println!();
+            println!(
+                "  {:<a$}  {:<b$}  {:>c$}  {:>d$}  {:>e$}  {:>f$}",
+                head[0],
+                head[1],
+                head[2],
+                head[3],
+                head[4],
+                head[5],
+                a = w[0],
+                b = w[1],
+                c = w[2],
+                d = w[3],
+                e = w[4],
+                f = w[5]
+            );
+            for r in &rows {
+                println!(
+                    "  {:<a$}  {:<b$}  {:>c$}  {:>d$}  {:>e$}  {:>f$}",
+                    r[0],
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    a = w[0],
+                    b = w[1],
+                    c = w[2],
+                    d = w[3],
+                    e = w[4],
+                    f = w[5]
+                );
+            }
+        }
+
         Cmd::Restore { snapshot, target, world, force, force_wipe, repo } => {
             let repo = open(&repo, &cfg, LockMode::Shared)?;
-            let id = repo.resolve(&snapshot)?;
+            let id = list::resolve(&repo, &snapshot)?;
             let mode = match (force, force_wipe) {
                 (_, true) => restore::Mode::Wipe,
                 (true, _) => restore::Mode::Replace,
@@ -419,7 +500,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 
         Cmd::Delete { snapshots, dry_run, repo } => {
             let repo = open(&repo, &cfg, LockMode::Exclusive)?;
-            let ids = snapshots.iter().map(|s| repo.resolve(s)).collect::<Result<Vec<_>>>()?;
+            let ids = snapshots.iter().map(|s| list::resolve(&repo, s)).collect::<Result<Vec<_>>>()?;
             let r = prune::delete(&repo, &ids, dry_run)?;
             print_removal(&r, dry_run);
         }
@@ -462,7 +543,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Verify { snapshot, repo } => {
             let repo = open(&repo, &cfg, LockMode::Shared)?;
             let ids = match snapshot {
-                Some(s) => vec![repo.resolve(&s)?],
+                Some(s) => vec![list::resolve(&repo, &s)?],
                 None => repo.snapshot_ids()?,
             };
             let pb = bar("verifying", false);

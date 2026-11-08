@@ -115,8 +115,10 @@ snapshot, and a restore of it loads cleanly:
    them leaves mobs and item frames wrong.
 2. **`vxl diff <a> <b>`** between snapshots, without restoring: which dimensions, regions
    and chunks changed. (`vxl compare` already does this for two folders.)
-3. **`vxl show <id>`** for snapshot details; **`restore --at "2026-11-07 03:00"`** picks
-   the nearest snapshot by time.
+3. ✅ **`vxl show <id>`** for snapshot details. Every command that takes a snapshot also
+   takes `latest` or a time (`vxl restore "2026-11-07 03:00" …`): the newest snapshot *at or
+   before* it (not the nearest: a rollback should never pick a snapshot from after the
+   moment asked for), refusing to guess across several sources.
 
 ## Phase 3: storage format v3 (decided by data)
 

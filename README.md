@@ -42,13 +42,18 @@ cargo install --path .
 | `init [path] [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: level 6, 16 MiB packs) |
 | `backup [folder] [-w world]… [--pre cmd] [--post cmd] [--strict] [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
 | `list` | snapshots, newest first, with what each one added and which worlds it holds |
+| `show <snapshot>` | one snapshot in detail: its worlds, files, chunks and sizes |
 | `restore <id> <folder> [-w world] [--force \| --force-wipe]` | rebuild a snapshot (or one world of it) into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
 | `compare <a> <b>` | compare two world folders chunk by chunk (e.g. original vs restored) and check `b`'s region files are laid out so Minecraft can read them |
 | `prune [--keep-last/hourly/daily/weekly/monthly/yearly N]… [--dry-run]` | drop snapshots no rule keeps, delete/compact packs holding data nothing references (see below) |
 | `delete <id>… [--dry-run]` | drop exactly these snapshots and collect the data only they used |
 
-Snapshot ids can be shortened to any unique prefix, like git. Every command takes
+Wherever a snapshot is expected you can give its id, shortened to any unique prefix like
+git; `latest`; or a local time, for the newest snapshot at or before it:
+`vxl restore "2026-11-07 03:00" ~/rollback` (a bare date means the end of that day). If the
+repo holds snapshots of several sources that would match, vxl asks for an id instead of
+guessing. Every command takes
 `-c/--config <file>` (see below).
 
 ## Config file and scheduling
