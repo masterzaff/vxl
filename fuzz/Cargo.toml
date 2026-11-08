@@ -1,0 +1,55 @@
+# Coverage-guided fuzzing (needs nightly): `cargo +nightly fuzz run <target>` from the
+# repo root, with cargo-fuzz installed. CI runs every target weekly (.github/workflows/fuzz.yml).
+# tests/robustness.rs covers the same parsers on stable with deterministic mutations.
+[package]
+name = "vxl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+tempfile = "3.27.0"
+vxl = { path = ".." }
+
+# Not part of the parent package's workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "region"
+path = "fuzz_targets/region.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_payload"
+path = "fuzz_targets/chunk_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nbt"
+path = "fuzz_targets/nbt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pack_index"
+path = "fuzz_targets/pack_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_cache"
+path = "fuzz_targets/index_cache.rs"
+test = false
+doc = false
+bench = false

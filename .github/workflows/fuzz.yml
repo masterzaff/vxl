@@ -1,0 +1,34 @@
+name: Fuzz
+# Coverage-guided fuzzing of every parser that reads bytes from disk. Weekly, and on demand.
+# A crash uploads the failing input as an artifact; reproduce it locally with
+# `cargo +nightly fuzz run <target> <file>`.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "120"
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [region, chunk_payload, nbt, pack_index, index_cache]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ inputs.seconds || '300' }} -rss_limit_mb=2048
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/

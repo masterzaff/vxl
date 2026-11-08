@@ -116,7 +116,10 @@ fn nbt() {
     for _ in 0..ROUNDS {
         let b = mutate(&bytes, &mut rng);
         for ext in [false, true] {
-            let _ = nbt::parse(&b, ext);
+            // Byte-exact by design: whatever parses writes back identically.
+            if let Ok(root) = nbt::parse(&b, ext) {
+                assert_eq!(root.write(), b, "ext={ext}");
+            }
         }
     }
     // Hostile nesting: lists of lists, far deeper than the parser allows.
