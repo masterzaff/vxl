@@ -6,6 +6,11 @@ Your live world stays a normal world folder. vxl keeps its own content-addressed
 store next to it: every chunk is decompressed, hashed with BLAKE3 and stored
 **once** with zstd, so a chunk that hasn't changed since the last backup costs nothing.
 
+Java Edition only (vanilla, Paper and forks, Fabric, Forge/NeoForge). Region files (`.mca`,
+`.mcc`) are deduplicated chunk by chunk; anything else in a world, including old `.mcr`
+regions or the `.linear` format of some Paper forks, is backed up whole. Bedrock worlds
+aren't supported.
+
 ```console
 $ vxl init /backups/survival-repo
 $ vxl backup ~/server/world --repo /backups/survival-repo -m "before nether update"
@@ -61,17 +66,65 @@ can't wipe your home directory.
 
 ## Backing up a running server
 
-Minecraft writes chunks in the background, so a world copied mid-save can be torn.
-Pause saving around the backup:
+Minecraft writes chunks in the background, so a world read mid-save can be torn. vxl
+doesn't know how your server runs; you tell it with two shell commands:
 
-```
-save-off
-save-all flush
-# run vxl backup
-save-on
+- `--pre <cmd>` runs first and should leave the world consistent on disk (usually: pause
+  saving and flush). If it fails, nothing is backed up.
+- `--post <cmd>` runs afterwards (usually: resume saving). It **always** runs once `--pre`
+  has run: also when the backup fails, and on Ctrl-C, SIGTERM or SIGHUP (vxl stops the
+  backup, runs `--post`, then exits with 130). It runs in its own process group, so the
+  Ctrl-C doesn't hit it too. If `--post` fails, vxl exits non-zero, but a snapshot that was
+  written is kept.
+
+They run through `sh -c` (`cmd /C` on Windows) in vxl's working directory, with
+`VXL_SOURCE` and `VXL_REPO` set; `--post` also gets `VXL_RESULT` (`ok`, `failed` or
+`interrupted`) and, on success, `VXL_SNAPSHOT` (the snapshot id). Even without hooks, vxl
+warns if a file changes while it reads it.
+
+**Docker** ([itzg/minecraft-server](https://github.com/itzg/docker-minecraft-server) has
+`rcon-cli` built in):
+
+```bash
+vxl backup ~/mc/data -m nightly \
+  --pre  'docker exec mc rcon-cli save-off && docker exec mc rcon-cli save-all flush' \
+  --post 'docker exec mc rcon-cli save-on'
 ```
 
-(Over RCON, e.g. with `mcrcon`.) If a file changes while vxl reads it, vxl warns you.
+**RCON** with [mcrcon](https://github.com/Tiiffi/mcrcon) (`enable-rcon=true` in
+`server.properties`; keep the RCON port off the internet, it's plaintext):
+
+```bash
+export MCRCON_PASS="$(cat ~/.rcon-password)"   # not on the command line
+vxl backup ~/server -m nightly \
+  --pre  'mcrcon save-off "save-all flush"' \
+  --post 'mcrcon save-on'
+```
+
+**tmux / screen console** (no reply to wait for, so give the save a moment):
+
+```bash
+vxl backup ~/server \
+  --pre  'tmux send-keys -t mc "save-off" Enter "save-all flush" Enter && sleep 15' \
+  --post 'tmux send-keys -t mc "save-on" Enter'
+```
+
+**Stop the server** (simplest and always consistent, at the cost of downtime):
+
+```bash
+vxl backup ~/server --pre 'systemctl stop minecraft' --post 'systemctl start minecraft'
+```
+
+**ZFS snapshot** (the server never pauses; vxl reads the frozen copy, which `--pre` creates):
+
+```bash
+vxl backup /tank/mc/.zfs/snapshot/vxl \
+  --pre  'zfs destroy tank/mc@vxl 2>/dev/null; zfs snapshot tank/mc@vxl' \
+  --post 'zfs destroy tank/mc@vxl'
+```
+
+The snapshot is only crash-consistent (like pulling the plug), so pair it with
+`save-all flush` in `--pre` if you can. btrfs and LVM snapshots work the same way.
 
 ## Whole servers
 

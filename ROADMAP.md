@@ -68,18 +68,21 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
    `stats/` and `advancements/`, so restoring just `world_nether` doesn't roll back anyone's
    inventory. The docs must say so.
    *First because today the Nether and End are easy to miss entirely.*
-2. **Pre/post hooks.** vxl doesn't know how the server runs; it just needs the world
+2. ✅ **Pre/post hooks.** vxl doesn't know how the server runs; it just needs the world
    consistent on disk while it reads. `pre` and `post` are shell commands (`--pre` /
    `--post`, or in the config); `post` **always** runs, also on error or Ctrl-C, and a
    failing `pre` aborts the backup (after still running `post`). Run via `sh -c` on Unix
-   and `cmd /C` on Windows, with the server folder as working directory. The same mechanism covers
+   and `cmd /C` on Windows, in vxl's working directory (the source may not exist until
+   `pre` ran, e.g. a ZFS snapshot), with `VXL_SOURCE`, `VXL_REPO`, and for `post`
+   `VXL_RESULT` and `VXL_SNAPSHOT`. `post` runs in its own process group so a Ctrl-C
+   doesn't kill it too. The same mechanism covers
    RCON, `docker exec`, panel APIs, tmux, stopping the server, or ZFS/btrfs snapshots.
 3. **Torn-read detection.** vxl parses every chunk anyway, so it can catch a region file
    that changed mid-read (bad chunk length, failed decompression, size or mtime changed
    between start and end of the read). Re-read that region a few times; warn, or fail with
    `--strict`, if it never settles. Makes hook-less backups safe in practice and double-checks
    hooked ones.
-4. **Hook recipes in the README**, ready to paste: RCON (`mcrcon`), itzg Docker
+4. ✅ **Hook recipes in the README**, ready to paste: RCON (`mcrcon`), itzg Docker
    (`docker exec mc rcon-cli`), tmux `send-keys`, ZFS snapshot, stop/start. A built-in RCON
    client is sugar for later, only if people keep asking. The README also states the scope:
    which files get chunk-level dedup (Anvil `.mca`/`.mcc`) and which are stored whole.

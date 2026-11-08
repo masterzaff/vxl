@@ -618,3 +618,105 @@ fn cli_server_folder() {
     assert!(out.contains(&format!("into {} |", end.display())), "{out}");
     assert!(end.join("level.dat").exists() && end.join("region/r.0.0.mca").exists());
 }
+
+#[test]
+fn cli_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = tmp.path().join("server");
+    let repo = tmp.path().join("repo");
+    synth::write_world(&s.join("world"), 60, &[(0, 0)], 5, Compression::Zlib, |_, _| 0).unwrap();
+    let vxl = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vxl"))
+            .args(args)
+            .env("VXL_REPO", &repo)
+            .current_dir(&s)
+            .output()
+            .unwrap()
+    };
+    let log = || {
+        let l = fs::read_to_string(s.join("hooks.log")).unwrap_or_default();
+        fs::remove_file(s.join("hooks.log")).ok();
+        l.lines().map(|l| l.trim().to_string()).collect::<Vec<_>>()
+    };
+    let src = s.to_str().unwrap();
+    assert!(vxl(&["init", repo.to_str().unwrap()]).status.success());
+
+    // Hooks run in vxl's working directory, around the backup.
+    let out = vxl(&["backup", src, "--pre", "echo pre>> hooks.log", "--post", "echo post>> hooks.log"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(log(), ["pre", "post"]);
+    assert_eq!(list::list(&Repo::open(&repo, LockMode::None).unwrap()).unwrap().len(), 1);
+
+    // A failing pre hook: no snapshot, post still runs, non-zero exit.
+    let out = vxl(&["backup", src, "--pre", "exit 4", "--post", "echo post>> hooks.log"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("pre hook failed"));
+    assert_eq!(log(), ["post"]);
+    assert_eq!(list::list(&Repo::open(&repo, LockMode::None).unwrap()).unwrap().len(), 1);
+
+    // A failing backup (no such world) still runs post.
+    let out = vxl(&["backup", src, "-w", "nope", "--post", "echo post>> hooks.log"]);
+    assert!(!out.status.success());
+    assert_eq!(log(), ["post"]);
+
+    // A failing post hook: the snapshot is kept, but the exit code says something's wrong.
+    let out = vxl(&["backup", src, "--post", "exit 1"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("post hook failed") && err.contains("snapshot itself was saved"), "{err}");
+    assert_eq!(list::list(&Repo::open(&repo, LockMode::None).unwrap()).unwrap().len(), 2);
+
+    // The pre hook may create the source (like a ZFS snapshot); post gets the snapshot id.
+    let frozen = tmp.path().join("frozen");
+    let pre = if cfg!(windows) {
+        format!("xcopy /E /I /Q \"{}\" \"{}\"", s.join("world").display(), frozen.display())
+    } else {
+        format!("cp -r '{}' '{}'", s.join("world").display(), frozen.display())
+    };
+    let post =
+        if cfg!(windows) { "echo %VXL_SNAPSHOT%>> hooks.log" } else { "echo $VXL_SNAPSHOT >> hooks.log" };
+    let out = vxl(&["backup", frozen.to_str().unwrap(), "--pre", &pre, "--post", post]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let id = log();
+    assert_eq!(id.len(), 1);
+    assert_eq!(id[0].len(), 64);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&id[0][..6]));
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_hooks_survive_sigint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = tmp.path().join("server");
+    let repo = tmp.path().join("repo");
+    synth::write_world(&s.join("world"), 61, &[(0, 0)], 5, Compression::Zlib, |_, _| 0).unwrap();
+    Repo::init(&repo, 3, TEST_PACK_SIZE).unwrap();
+
+    // The pre hook "hangs" (like a slow save-all); interrupt vxl while it does.
+    // vxl gets its own process group, like a job a terminal starts.
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vxl"))
+        .process_group(0)
+        .current_dir(&s)
+        .args(["backup", s.to_str().unwrap(), "--pre", "echo pre>> hooks.log; sleep 30"])
+        .args(["--post", r#"echo "post $VXL_RESULT" >> hooks.log"#])
+        .env("VXL_REPO", &repo)
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while !s.join("hooks.log").exists() {
+        assert!(started.elapsed().as_secs() < 10, "pre hook never started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // (vxl installs its handler before starting the pre hook, so it's in place now.)
+    // Like a terminal's Ctrl-C: signal the whole group, vxl and its pre hook alike.
+    assert!(
+        Command::new("kill").args(["-INT", "--", &format!("-{}", child.id())]).status().unwrap().success()
+    );
+    let st = child.wait().unwrap();
+    assert!(started.elapsed().as_secs() < 20, "vxl waited for the pre hook instead of stopping");
+    assert_eq!(st.code(), Some(130));
+    let log = fs::read_to_string(s.join("hooks.log")).unwrap();
+    assert_eq!(log.lines().collect::<Vec<_>>(), ["pre", "post interrupted"]);
+    assert!(list::list(&Repo::open(&repo, LockMode::None).unwrap()).unwrap().is_empty());
+}

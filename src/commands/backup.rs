@@ -9,6 +9,7 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 
 use crate::anvil;
+use crate::hooks::check_interrupted;
 use crate::manifest::{ChunkEntry, FORMAT_VERSION, FileEntry, Snapshot, SnapshotHeader, Stats, World};
 use crate::repo::{ObjectId, Repo};
 use crate::world::{self, FoundWorld, Kind, Scan, WorldFile};
@@ -62,8 +63,9 @@ pub fn backup(
         worlds.push(World { name: w.name.clone(), path: w.rel.clone(), stats: s, files });
     }
 
-    // Objects first, durably; then the manifest. A crash before this point leaves
-    // only unreferenced objects, which `prune` cleans up.
+    // Objects first, durably; then the manifest. A crash (or interrupt) before this
+    // point leaves only unreferenced objects, which `prune` cleans up.
+    check_interrupted()?;
     repo.flush()?;
     let snap = Snapshot {
         header: SnapshotHeader {
@@ -106,6 +108,7 @@ fn backup_world(
     let mut done: Vec<Done> = files
         .par_iter()
         .map(|f| {
+            check_interrupted()?;
             let r = match f.kind {
                 Kind::Region { coords } => backup_region(repo, f, coords),
                 _ => backup_blob(repo, f),
@@ -120,7 +123,10 @@ fn backup_world(
     let orphans: Vec<&WorldFile> = externals.iter().filter(|f| !consumed.contains(&f.abs)).collect();
     let orphan_done: Vec<Done> = orphans
         .par_iter()
-        .map(|f| backup_blob(repo, f).with_context(|| format!("backing up {name}/{}", f.rel)))
+        .map(|f| {
+            check_interrupted()?;
+            backup_blob(repo, f).with_context(|| format!("backing up {name}/{}", f.rel))
+        })
         .collect::<Result<_>>()?;
     progress.inc(externals.iter().map(|f| f.size).sum());
     done.extend(orphan_done);
@@ -146,7 +152,9 @@ fn read_checked(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<u8>> {
     let before = stamp(path)?;
     let data = fs::read(path)?;
     if stamp(path)? != before || data.len() as u64 != before.1 {
-        warnings.push("changed while being read — is the server still saving? (run `save-off` first)".into());
+        warnings.push(
+            "changed while being read — is the server still saving? (pause saving with a --pre hook)".into(),
+        );
     }
     Ok(data)
 }

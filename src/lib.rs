@@ -5,7 +5,8 @@
 //! - [`repo`]     : the on-disk repository and its content-addressed object store
 //! - [`pack`]     : the pack file format objects are stored in
 //! - [`manifest`] : the snapshot format (what a backup *is*)
-//! - [`world`]    : walking a world folder and classifying files
+//! - [`world`]    : finding worlds in a server folder, walking a world and classifying files
+//! - [`hooks`]    : pre/post shell commands around a backup, Ctrl-C handling
 //! - [`nbt`], [`transform`]: byte-exact NBT + experimental reversible chunk transforms
 //! - [`commands`] : the actual `init/backup/list/restore/prune/verify` logic
 //!
@@ -13,6 +14,7 @@
 
 pub mod anvil;
 pub mod commands;
+pub mod hooks;
 pub mod manifest;
 pub mod nbt;
 pub mod pack;

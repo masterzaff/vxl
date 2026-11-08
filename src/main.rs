@@ -2,12 +2,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use vxl::commands::{backup, compare, list, prune, restore, verify};
+use vxl::hooks::{self, Hooks};
 use vxl::repo::{self, LockMode, Repo};
 use vxl::util::{human_bytes, thousands};
 
@@ -48,6 +49,17 @@ enum Cmd {
         /// (`worlds/lobby`), `*` for all, `!name` to leave one out. Repeatable; default `*`.
         #[arg(long = "world", short = 'w', value_name = "WORLD")]
         worlds: Vec<String>,
+        /// Shell command to run first, to make the world consistent on disk (e.g. pause saving:
+        /// `docker exec mc rcon-cli save-off && docker exec mc rcon-cli 'save-all flush'`).
+        /// If it fails, nothing is backed up. Runs before SOURCE is read, so it may create it
+        /// (e.g. a ZFS snapshot). Gets VXL_SOURCE and VXL_REPO.
+        #[arg(long, value_name = "CMD")]
+        pre: Option<String>,
+        /// Shell command to run afterwards (e.g. `save-on`). Always runs once --pre has run:
+        /// also when the backup fails or is interrupted. Gets VXL_RESULT=ok|failed|interrupted
+        /// and, on success, VXL_SNAPSHOT=<id>.
+        #[arg(long, value_name = "CMD")]
+        post: Option<String>,
         #[command(flatten)]
         repo: RepoArg,
         /// Note to attach to the snapshot.
@@ -161,12 +173,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("initialized empty vxl repository in {}", path.display());
         }
 
-        Cmd::Backup { source, worlds, repo, message } => {
-            let repo = open(&repo, LockMode::Exclusive)?;
+        Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post } => {
+            // Lock first: if another backup is running, fail before pausing the server.
+            let repo = open(&repo_arg, LockMode::Exclusive)?;
+            // Hooks run in our own working directory: SOURCE may not exist until `pre` ran.
+            let abs = |p: &std::path::Path| std::path::absolute(p).map(|p| p.display().to_string());
+            let hooks = Hooks {
+                pre,
+                post,
+                env: vec![
+                    ("VXL_SOURCE".into(), abs(&source).context("resolving the source path")?),
+                    ("VXL_REPO".into(), abs(repo.root()).context("resolving the repo path")?),
+                ],
+                cwd: std::env::current_dir().context("reading the working directory")?,
+            };
+            if hooks.pre.is_some() || hooks.post.is_some() {
+                hooks::install_interrupt_handler()?;
+            }
             let start = Instant::now();
             let pb = bar("backing up", true);
-            let r = backup::backup(&repo, &source, &worlds, message, &pb)?;
-            pb.finish_and_clear();
+            let out = hooks.around(
+                || {
+                    let r = backup::backup(&repo, &source, &worlds, message, &pb);
+                    pb.finish_and_clear();
+                    r
+                },
+                |r| vec![("VXL_SNAPSHOT".into(), r.id.hex())],
+            );
+            let r = match out.result {
+                Ok(r) => r,
+                Err(e) => {
+                    pb.finish_and_clear();
+                    eprintln!("error: {e:#}");
+                    if let Some(pe) = out.post_error {
+                        eprintln!("error: {pe:#}");
+                    }
+                    return Ok(if hooks::interrupted() { ExitCode::from(130) } else { ExitCode::FAILURE });
+                }
+            };
             print_warnings(&r.warnings);
             if r.worlds.len() > 1 || r.worlds[0].rel != "." {
                 let names: Vec<String> = r
@@ -185,6 +229,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 human_bytes(s.stored_bytes),
                 start.elapsed().as_secs_f64()
             );
+            if let Some(pe) = out.post_error {
+                eprintln!("error: {pe:#} (the snapshot itself was saved)");
+                return Ok(ExitCode::FAILURE);
+            }
         }
 
         Cmd::List { repo } => {
