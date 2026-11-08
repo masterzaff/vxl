@@ -7,7 +7,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use vxl::commands::{backup, list, prune, restore, verify};
+use vxl::commands::{backup, compare, list, prune, restore, verify};
 use vxl::repo::{self, LockMode, Repo};
 use vxl::util::{human_bytes, thousands};
 
@@ -85,6 +85,14 @@ enum Cmd {
         snapshot: Option<String>,
         #[command(flatten)]
         repo: RepoArg,
+    },
+    /// Compare two world folders chunk by chunk (e.g. original vs restored).
+    /// Also checks that region files in the second one are readable by Minecraft.
+    Compare {
+        /// The reference world (e.g. the original).
+        a: PathBuf,
+        /// The world to check (e.g. the restored copy).
+        b: PathBuf,
     },
 }
 
@@ -237,6 +245,41 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     "({} unused objects stay in packs that are mostly still in use)",
                     thousands(r.garbage_left)
                 );
+            }
+        }
+
+        Cmd::Compare { a, b } => {
+            let r = compare::compare(&a, &b)?;
+            for d in r.differences.iter().take(30) {
+                println!("differs: {d}");
+            }
+            if r.differences.len() > 30 {
+                println!("differs: … and {} more", r.differences.len() - 30);
+            }
+            for d in r.layout_problems.iter().take(30) {
+                println!("layout:  {d}");
+            }
+            if r.layout_problems.len() > 30 {
+                println!("layout:  … and {} more", r.layout_problems.len() - 30);
+            }
+            println!(
+                "compared {} files ({} region files) | {} of {} chunks identical | {}",
+                thousands(r.files),
+                thousands(r.regions),
+                thousands(r.same_chunks),
+                thousands(r.chunks),
+                if r.identical() {
+                    "same world, readable layout".to_string()
+                } else {
+                    format!(
+                        "{} differences, {} layout problems",
+                        r.differences.len(),
+                        r.layout_problems.len()
+                    )
+                }
+            );
+            if !r.identical() {
+                return Ok(ExitCode::FAILURE);
             }
         }
 

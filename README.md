@@ -38,6 +38,7 @@ cargo install --path .
 | `list` | snapshots, newest first, with what each one added |
 | `restore <id> <folder> [--force \| --force-wipe]` | rebuild a snapshot into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
+| `compare <a> <b>` | compare two world folders chunk by chunk (e.g. original vs restored) and check `b`'s region files are laid out so Minecraft can read them |
 | `prune [--keep-last N] [--dry-run]` | drop old snapshots, delete/compact packs holding data nothing references |
 
 Snapshot ids can be shortened to any unique prefix, like git.

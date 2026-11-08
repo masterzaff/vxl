@@ -165,6 +165,55 @@ pub fn parse_region(
     Ok(out)
 }
 
+/// Check a region file's layout the way Minecraft reads it: every chunk's
+/// sectors start after the header, lie inside the file, are big enough for the
+/// chunk's length prefix, and don't overlap another chunk's. Returns problems found.
+pub fn check_layout(data: &[u8]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if data.len() < HEADER_LEN {
+        return vec![format!("only {} bytes, smaller than the 8 KiB header", data.len())];
+    }
+    let file_sectors = data.len().div_ceil(SECTOR);
+    let mut ranges = Vec::new();
+    for slot in 0..SLOTS {
+        let loc = be_u32(&data[slot * 4..]);
+        if loc == 0 {
+            continue;
+        }
+        let (start, count) = ((loc >> 8) as usize, (loc & 0xFF) as usize);
+        let at = format!("chunk ({},{})", slot % 32, slot / 32);
+        if start < 2 || count == 0 || start + count > file_sectors {
+            problems.push(format!("{at}: sectors {start}+{count} outside the file ({file_sectors} sectors)"));
+            continue;
+        }
+        let off = start * SECTOR;
+        if off + 5 > data.len() {
+            problems.push(format!("{at}: header cut off at end of file"));
+            continue;
+        }
+        let len = be_u32(&data[off..]) as usize;
+        let external = data[off + 4] & EXTERNAL_FLAG != 0;
+        if len == 0 || (!external && 4 + len > count * SECTOR) || off + 4 + len > data.len() {
+            problems.push(format!("{at}: length {len} doesn't fit its {count} sector(s)"));
+        }
+        ranges.push((start, start + count, slot));
+    }
+    ranges.sort_unstable();
+    for w in ranges.windows(2) {
+        if w[1].0 < w[0].1 {
+            let (a, b) = (w[0].2, w[1].2);
+            problems.push(format!(
+                "chunks ({},{}) and ({},{}) share sectors",
+                a % 32,
+                a / 32,
+                b % 32,
+                b / 32
+            ));
+        }
+    }
+    problems
+}
+
 /// A rebuilt region file plus any `.mcc` files it needs next to it.
 pub struct BuiltRegion {
     pub region: Vec<u8>,

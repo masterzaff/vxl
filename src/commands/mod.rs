@@ -2,6 +2,7 @@
 //! Keeping printing out of here makes the logic easy to test.
 
 pub mod backup;
+pub mod compare;
 pub mod list;
 pub mod prune;
 pub mod restore;

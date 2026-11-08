@@ -423,3 +423,39 @@ fn packs_from_a_crashed_backup_are_collected() {
     let v = verify::verify(&repo(&env), &[id], &hidden()).unwrap();
     assert!(v.problems.is_empty());
 }
+
+#[test]
+fn compare_confirms_restores_and_catches_differences() {
+    use vxl::commands::compare::compare;
+    let env = setup();
+    synth::write_world(&env.world, 10, &[(0, 0), (-1, 2)], 60, Compression::Zlib, |_, _| 0).unwrap();
+    let id = do_backup(&env, "x").id;
+    let out = do_restore(&env, &id, "out");
+
+    // A faithful restore: same world, readable layout (session.lock is ignored).
+    let r = compare(&env.world, &out).unwrap();
+    assert!(r.identical(), "{:?} {:?}", r.differences, r.layout_problems);
+    assert_eq!((r.regions, r.chunks, r.same_chunks), (2, 120, 120));
+
+    // Change one chunk's data and one file, drop a file: all three are reported.
+    let edited = |cx: i32, cz: i32| if (cx, cz) == (3, 0) { 7 } else { 0 };
+    synth::write_world(&out, 10, &[(0, 0)], 60, Compression::Zlib, edited).unwrap();
+    fs::remove_file(out.join("region/r.-1.2.mca")).unwrap();
+    fs::write(out.join("level.dat"), b"nope").unwrap();
+    let r = compare(&env.world, &out).unwrap();
+    assert!(
+        r.differences.iter().any(|d| d.contains("region/r.0.0.mca: chunk (3,0): data, timestamp differ"))
+    );
+    assert!(r.differences.iter().any(|d| d.contains("r.-1.2.mca: missing")));
+    assert!(r.differences.iter().any(|d| d.starts_with("level.dat")));
+    assert_eq!(r.differences.len(), 3, "{:?}", r.differences);
+
+    // Overlapping sectors are a layout problem even if the data reads fine.
+    let path = out.join("region/r.0.0.mca");
+    let mut bytes = fs::read(&path).unwrap();
+    let first = bytes[0..4].to_vec();
+    bytes[4..8].copy_from_slice(&first); // slot 1 now points at slot 0's sectors
+    fs::write(&path, bytes).unwrap();
+    let r = compare(&env.world, &out).unwrap();
+    assert!(r.layout_problems.iter().any(|p| p.contains("share sectors")), "{:?}", r.layout_problems);
+}
