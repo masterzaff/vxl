@@ -10,6 +10,8 @@
 //!   split            skeleton + one object per section (sub-chunk dedup)
 //!   split+unpack     both
 //!   ...+light        also expand light nibbles
+//!   grouped split    split for dedup, but a chunk's skeleton and its *new* sections
+//!                    are compressed together as one object (keeps zstd's context)
 //!
 //! Every transformed chunk is verified to decode byte-identically; chunks that
 //! don't are counted as fallbacks and stored whole.
@@ -39,6 +41,8 @@ const BLOCKS_PER_EDIT: u32 = 40; // edit intensity (out of 4096 odds per near-su
 struct Method {
     name: &'static str,
     codec: Option<Codec>,
+    /// Compress skeleton + new sections as one object instead of separately.
+    grouped: bool,
     seen: Mutex<HashSet<ObjectId>>,
     /// stored bytes per version
     per_version: Mutex<Vec<u64>>,
@@ -52,10 +56,11 @@ struct Method {
 }
 
 impl Method {
-    fn new(name: &'static str, codec: Option<Codec>) -> Self {
+    fn new(name: &'static str, codec: Option<Codec>, grouped: bool) -> Self {
         Method {
             name,
             codec,
+            grouped,
             seen: Mutex::default(),
             per_version: Mutex::default(),
             current: AtomicU64::new(0),
@@ -78,6 +83,27 @@ impl Method {
         n
     }
 
+    /// Grouped: if the skeleton is new, store one object holding it plus every
+    /// section not stored before. (An unchanged skeleton implies unchanged
+    /// sections, since it contains their hashes.)
+    fn store_grouped(&self, enc: &transform::Encoded) {
+        if !self.seen.lock().unwrap().insert(ObjectId::of(&enc.main)) {
+            return;
+        }
+        let mut buf = enc.main.clone();
+        for p in &enc.parts {
+            self.parts_total.fetch_add(1, Relaxed);
+            if self.seen.lock().unwrap().insert(ObjectId::of(p)) {
+                buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                buf.extend_from_slice(p);
+                self.parts_new.fetch_add(1, Relaxed);
+            }
+        }
+        let n = zstd::bulk::compress(&buf, ZSTD_LEVEL).unwrap().len() as u64;
+        self.current.fetch_add(n, Relaxed);
+        self.main_bytes.fetch_add(n, Relaxed);
+    }
+
     fn process(&self, chunks: &[Vec<u8>]) {
         let t = Instant::now();
         chunks.par_iter().for_each(|nbt| {
@@ -86,6 +112,7 @@ impl Method {
                 return;
             };
             match transform::encode(nbt, codec) {
+                Ok(enc) if self.grouped => self.store_grouped(&enc),
                 Ok(enc) => {
                     self.main_bytes.fetch_add(self.store(&enc.main), Relaxed);
                     for p in &enc.parts {
@@ -204,12 +231,13 @@ fn main() {
 
     let c = |split, unpack, light| Some(Codec { split, unpack, light });
     let methods = [
-        Method::new("whole (today)", None),
-        Method::new("unpack", c(false, true, false)),
-        Method::new("unpack+light", c(false, true, true)),
-        Method::new("split", c(true, false, false)),
-        Method::new("split+unpack", c(true, true, false)),
-        Method::new("split+unpack+light", c(true, true, true)),
+        Method::new("whole (today)", None, false),
+        Method::new("unpack", c(false, true, false), false),
+        Method::new("unpack+light", c(false, true, true), false),
+        Method::new("split", c(true, false, false), false),
+        Method::new("split+unpack", c(true, true, false), false),
+        Method::new("grouped split", c(true, false, false), true),
+        Method::new("grouped split+unpack", c(true, true, false), true),
     ];
 
     let mut raw_total = 0u64;
@@ -265,7 +293,7 @@ fn main() {
         let total: u64 = pv.iter().sum();
         let secs = m.time.lock().unwrap().as_secs_f64();
         println!(
-            "{:<20} {:>12} {:>6} {:>13} {:>6} {:>12} {:>6} {:>10.0} {:>9}",
+            "{:<22} {:>12} {:>6} {:>13} {:>6} {:>12} {:>6} {:>10.0} {:>9}",
             m.name,
             human_bytes(pv[0]),
             pct(pv[0], base[0]),
@@ -282,7 +310,15 @@ fn main() {
     if let Some(first) = first {
         println!("\nfirst backup, split methods:");
         for (m, (main, part, total, new)) in methods.iter().zip(first) {
-            if m.codec.is_some_and(|c| c.split) {
+            if m.grouped {
+                println!(
+                    "  {:<20} combined objects {:>9}            ({} of {} sections distinct)",
+                    m.name,
+                    human_bytes(main),
+                    new,
+                    total
+                );
+            } else if m.codec.is_some_and(|c| c.split) {
                 println!(
                     "  {:<20} skeletons {:>9}, sections {:>9} ({} of {} sections distinct)",
                     m.name,
@@ -298,13 +334,13 @@ fn main() {
         println!("\nper version (stored bytes):");
         print!("  {:<14}", "");
         for m in &methods {
-            print!(" {:>19}", m.name);
+            print!(" {:>21}", m.name);
         }
         println!();
         for (i, (name, n)) in chunk_counts.iter().enumerate() {
             print!("  {:<14}", format!("{name} ({n})").chars().take(14).collect::<String>());
             for m in &methods {
-                print!(" {:>19}", human_bytes(m.per_version.lock().unwrap()[i]));
+                print!(" {:>21}", human_bytes(m.per_version.lock().unwrap()[i]));
             }
             println!();
         }

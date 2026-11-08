@@ -166,10 +166,16 @@ Synthetic result (4,096 chunks, 5 nights, 30% of chunks loaded and 3% edited per
 | unpack | 105% | 105% | 105% |
 | split | 133% | **25%** | **66%** |
 | split + unpack | 139% | 23% | 68% |
+| **grouped split** | 114% | **25%** | **59%** |
 
-Unpacking didn't help on this data. Splitting makes nightly backups ~4× smaller but the
-first one ~⅓ bigger (sections compressed one by one lose shared context), and it's ~3.5×
-slower. Every transformed chunk was verified byte-identical; zero fallbacks.
+Unpacking didn't help on this data (its sections all fit in 4 bits per block, which is
+already byte-aligned). Splitting makes nightly backups ~4× smaller, but compressing each
+section on its own loses shared context, so the first backup grows by a third. *Grouped*
+split keeps the dedup but compresses a chunk's skeleton and its new sections together as one
+object, which brings the first backup down to +14%. Most of what's left is probably the
+32-byte section hashes inside each skeleton (24 per chunk, incompressible: ~3.1 MB here).
+Splitting runs ~3.3× slower than storing chunks whole. Every transformed chunk was verified
+byte-identical; zero fallbacks.
 
 ## Known limitations
 
