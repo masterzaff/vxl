@@ -53,3 +53,10 @@ path = "fuzz_targets/index_cache.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "group"
+path = "fuzz_targets/group.rs"
+test = false
+doc = false
+bench = false

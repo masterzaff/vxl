@@ -7,11 +7,18 @@
 //!   packs/<id>.pack         many zstd-compressed objects + an index (see `pack.rs`)
 //!   snapshots/<id>.json.zst manifests
 //!   cache/headers/<id>.json snapshot headers, so `list` needn't read whole manifests
+//!   cache/packs.idx         every pack's index in one file (see `index_cache.rs`)
 //!   tmp/                    staging area for atomic writes
 //! ```
 //!
 //! Objects are named by the BLAKE3 of their *uncompressed* content. On open we
 //! read every pack's index into memory: object id → (pack, offset, length).
+//!
+//! Format 3 adds group objects for chunks (see `group.rs`): named by the chunk they
+//! decode to, and possibly reading sections from other group objects. [`Repo::get`]
+//! decodes them transparently; [`Repo::deps`] says what one needs, for `prune`. Packs
+//! are written strictly in the order they were filled, so after a crash every written
+//! object's sources are on disk too.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -22,6 +29,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::group::{self, Body};
 use crate::index_cache;
 use crate::manifest::{Snapshot, SnapshotHeader};
 use crate::pack::{self, Builder, Entry};
@@ -29,8 +37,14 @@ use crate::util::{atomic_write, sync_dir};
 
 /// How long `open` waits for a lock someone else holds before reporting the repo busy.
 pub const LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-/// Repository layout version. v1 (loose object files) only existed in early dev builds.
-pub const REPO_VERSION: u32 = 2;
+/// Newest repository format this vxl reads and writes. v1 (loose object files) only
+/// existed in early dev builds; v2 stores every chunk whole; v3 also stores chunks as
+/// group objects (`group.rs`).
+pub const REPO_VERSION: u32 = 3;
+/// Format `vxl init` creates unless told otherwise.
+pub const DEFAULT_REPO_VERSION: u32 = 2;
+/// Group objects kept decoded in memory, for reading sections out of them.
+const BODY_CACHE: usize = 1024;
 /// Default zstd level for objects. Chosen by `examples/zstd_levels.rs`: past
 /// this point each extra level costs a lot of speed for very little space.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 6;
@@ -134,15 +148,50 @@ struct Loc {
 struct Index {
     packs: HashMap<ObjectId, PackInfo>,
     objects: HashMap<ObjectId, Loc>,
+    /// Further copies of an object: a repaired group object (`chunk_store.rs`), a chunk
+    /// `migrate` converted, or a crash during repack. Reads try every copy.
+    extra: HashMap<ObjectId, Vec<Loc>>,
 }
 
 impl Index {
-    fn add(&mut self, info: PackInfo) {
+    /// `newest`: the pack was just written, so its copies become the primary ones.
+    fn add(&mut self, info: PackInfo, newest: bool) {
         for e in &info.entries {
-            // A crash during repack can leave an object in two packs; either copy is fine.
-            self.objects.insert(e.id, Loc { pack: info.id, offset: e.offset, len: e.len });
+            let loc = Loc { pack: info.id, offset: e.offset, len: e.len };
+            match self.objects.get_mut(&e.id) {
+                None => {
+                    self.objects.insert(e.id, loc);
+                }
+                Some(cur) if cur.pack == info.id => {}
+                Some(cur) => {
+                    let other = if newest { std::mem::replace(cur, loc) } else { loc };
+                    self.extra.entry(e.id).or_default().push(other);
+                }
+            }
         }
         self.packs.insert(info.id, info);
+    }
+
+    fn copies(&self, id: &ObjectId) -> Vec<Loc> {
+        self.objects.get(id).into_iter().chain(self.extra.get(id).into_iter().flatten()).copied().collect()
+    }
+
+    fn remove_pack(&mut self, pack: &ObjectId) {
+        let Some(info) = self.packs.remove(pack) else { return };
+        for e in info.entries {
+            if let Some(extra) = self.extra.get_mut(&e.id) {
+                extra.retain(|l| l.pack != *pack);
+            }
+            if self.objects.get(&e.id).is_some_and(|l| l.pack == *pack) {
+                match self.extra.get_mut(&e.id).and_then(|x| x.pop()) {
+                    Some(l) => self.objects.insert(e.id, l),
+                    None => self.objects.remove(&e.id),
+                };
+            }
+            if self.extra.get(&e.id).is_some_and(|x| x.is_empty()) {
+                self.extra.remove(&e.id);
+            }
+        }
     }
 }
 
@@ -154,6 +203,11 @@ pub struct Repo {
     known: Mutex<HashSet<ObjectId>>,
     /// The pack currently being filled.
     open_pack: Mutex<Builder>,
+    /// Held while writing a full pack; taken before the open pack is released, so packs
+    /// reach the disk in the order they were filled.
+    write_order: Mutex<()>,
+    /// Recently used group objects, decoded (see [`Repo::source_body`]).
+    bodies: Mutex<HashMap<ObjectId, Arc<Body>>>,
     /// Open file handles, so restoring 100k chunks doesn't mean 100k `open()` calls.
     handles: Mutex<HashMap<ObjectId, Arc<File>>>,
     /// Problems found while loading (e.g. an unreadable pack).
@@ -162,8 +216,16 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// Create a new, empty repository at `path` (must not exist or be empty).
+    /// Create a new, empty repository at `path` (must not exist or be empty) in the
+    /// default format.
     pub fn init(path: &Path, zstd_level: i32, pack_size: u64) -> Result<()> {
+        Self::init_format(path, zstd_level, pack_size, DEFAULT_REPO_VERSION)
+    }
+
+    pub fn init_format(path: &Path, zstd_level: i32, pack_size: u64, version: u32) -> Result<()> {
+        if !(2..=REPO_VERSION).contains(&version) {
+            bail!("repository format must be 2 or 3");
+        }
         if !(1..=22).contains(&zstd_level) {
             bail!("zstd level must be between 1 and 22");
         }
@@ -177,7 +239,7 @@ impl Repo {
             fs::create_dir_all(path.join(d))?;
         }
         File::create(path.join("lock"))?;
-        let config = Config { version: REPO_VERSION, zstd_level, pack_size };
+        let config = Config { version, zstd_level, pack_size };
         atomic_write(&path.join("config.json"), &path.join("tmp"), &serde_json::to_vec_pretty(&config)?)?;
         sync_dir(path)?;
         Ok(())
@@ -195,7 +257,7 @@ impl Repo {
         if version > REPO_VERSION as u64 {
             bail!("repository format v{version} is newer than this vxl (v{REPO_VERSION}); upgrade vxl");
         }
-        if version < REPO_VERSION as u64 {
+        if version < 2 {
             bail!(
                 "repository format v{version} is from an early development build of vxl and \
                  can't be read any more; create a new repository with `vxl init`"
@@ -231,6 +293,8 @@ impl Repo {
             index: RwLock::default(),
             known: Mutex::default(),
             open_pack: Mutex::default(),
+            write_order: Mutex::default(),
+            bodies: Mutex::default(),
             handles: Mutex::default(),
             warnings: Vec::new(),
             _lock: lock_file,
@@ -265,12 +329,12 @@ impl Repo {
             if let Some((cached_size, entries)) = cached.remove(&id)
                 && cached_size == size
             {
-                index.add(PackInfo { id, size, entries });
+                index.add(PackInfo { id, size, entries }, false);
                 continue;
             }
             changed = true;
             match pack::read_index(&path) {
-                Ok((size, entries)) => index.add(PackInfo { id, size, entries }),
+                Ok((size, entries)) => index.add(PackInfo { id, size, entries }, false),
                 Err(e) => self.warnings.push(format!("ignoring unreadable pack {}: {e:#}", path.display())),
             }
         }
@@ -285,6 +349,23 @@ impl Repo {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Format 3: chunks are stored as group objects.
+    pub fn grouped(&self) -> bool {
+        self.config.version >= 3
+    }
+
+    /// Switch the repository to format 3 (for `migrate`). Needs the exclusive lock.
+    pub fn upgrade_to_grouped(&mut self) -> Result<()> {
+        if self.grouped() {
+            return Ok(());
+        }
+        let config = Config { version: 3, ..self.config.clone() };
+        atomic_write(&self.root.join("config.json"), &self.tmp_dir(), &serde_json::to_vec_pretty(&config)?)?;
+        sync_dir(&self.root)?;
+        self.config = config;
+        Ok(())
     }
 
     fn tmp_dir(&self) -> PathBuf {
@@ -309,30 +390,69 @@ impl Repo {
             return Ok(Put { id, stored: None });
         }
         let packed = zstd::bulk::compress(data, self.config.zstd_level)?;
-        let full = {
-            let mut open = self.open_pack.lock().unwrap();
-            open.add(id, &packed)?;
-            (open.data_len() >= self.config.pack_size).then(|| std::mem::take(&mut *open))
-        };
-        // Write a full pack outside the lock so other threads keep filling a new one.
-        if let Some(b) = full {
-            self.write_pack(b)?;
-        }
+        self.add_stored(id, &packed)?;
         Ok(Put { id, stored: Some(packed.len() as u64) })
+    }
+
+    /// Store an object whose stored form is already made (a group object). With
+    /// `replace`, it's stored even if the repo has the id already (that copy is broken,
+    /// or plain and being converted): reads then try every copy.
+    pub fn put_stored(&self, id: ObjectId, stored: &[u8], replace: bool) -> Result<Put> {
+        if !replace && self.index.read().unwrap().objects.contains_key(&id) {
+            return Ok(Put { id, stored: None });
+        }
+        if !self.known.lock().unwrap().insert(id) {
+            return Ok(Put { id, stored: None });
+        }
+        self.bodies.lock().unwrap().remove(&id);
+        self.add_stored(id, stored)?;
+        Ok(Put { id, stored: Some(stored.len() as u64) })
+    }
+
+    /// Whether the repo has `id` (in a written pack).
+    pub fn has(&self, id: &ObjectId) -> bool {
+        self.index.read().unwrap().objects.contains_key(id)
+    }
+
+    /// Whether this process stored (or is storing) `id`.
+    pub fn stored_here(&self, id: &ObjectId) -> bool {
+        self.known.lock().unwrap().contains(id)
+    }
+
+    fn add_stored(&self, id: ObjectId, stored: &[u8]) -> Result<()> {
+        let mut open = self.open_pack.lock().unwrap();
+        open.add(id, stored)?;
+        if open.data_len() >= self.config.pack_size {
+            let full = std::mem::take(&mut *open);
+            // Queue for writing before letting anyone fill the next pack: packs then reach
+            // the disk in order, and an object never lands before one it reads from.
+            let order = self.write_order.lock().unwrap();
+            drop(open);
+            self.write_pack(full)?;
+            drop(order);
+        }
+        Ok(())
     }
 
     fn write_pack(&self, b: Builder) -> Result<ObjectId> {
         let done = b.finish();
         atomic_write(&self.pack_path(&done.id), &self.tmp_dir(), &done.bytes)
             .with_context(|| format!("writing pack {}", done.id))?;
+        if self.grouped() {
+            // Make this pack's rename durable before any later pack's.
+            sync_dir(&self.root.join("packs"))?;
+        }
         let info = PackInfo { id: done.id, size: done.bytes.len() as u64, entries: done.entries };
-        self.index.write().unwrap().add(info);
+        self.index.write().unwrap().add(info, true);
         Ok(done.id)
     }
 
     /// Write the partly filled pack and make all new packs durable.
     pub fn flush(&self) -> Result<()> {
-        let b = std::mem::take(&mut *self.open_pack.lock().unwrap());
+        let mut open = self.open_pack.lock().unwrap();
+        let b = std::mem::take(&mut *open);
+        let _order = self.write_order.lock().unwrap();
+        drop(open);
         if !b.is_empty() {
             self.write_pack(b)?;
         }
@@ -351,19 +471,130 @@ impl Repo {
         Ok(f)
     }
 
-    /// The compressed bytes of an object, unverified.
+    /// The stored bytes of an object (its primary copy), unverified.
     pub fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
         let loc =
             *self.index.read().unwrap().objects.get(id).ok_or_else(|| anyhow!("object {id} is missing"))?;
-        let mut buf = vec![0u8; loc.len as usize];
+        self.read_loc(id, loc, loc.len as usize)
+    }
+
+    /// The first `max` stored bytes of the copy at `loc`.
+    fn read_loc(&self, id: &ObjectId, loc: Loc, max: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; (loc.len as usize).min(max)];
         pack::read_at(&*self.handle(&loc.pack)?, &mut buf, loc.offset)
             .with_context(|| format!("reading object {id} from pack {}", loc.pack))?;
         Ok(buf)
     }
 
-    /// Load and verify an object.
+    fn copies(&self, id: &ObjectId) -> Result<Vec<Loc>> {
+        let copies = self.index.read().unwrap().copies(id);
+        if copies.is_empty() {
+            bail!("object {id} is missing");
+        }
+        Ok(copies)
+    }
+
+    /// Load and verify an object: its content hashes to `id` (for a group object, the
+    /// chunk it decodes to does). Tries every copy until one is good.
     pub fn get(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        decode_verified(id, &self.read_raw(id)?)
+        let mut err = None;
+        for loc in self.copies(id)? {
+            match self.read_loc(id, loc, usize::MAX).and_then(|raw| self.decode(id, &raw)) {
+                Ok(data) => return Ok(data),
+                Err(e) => err = Some(e),
+            }
+        }
+        Err(err.unwrap())
+    }
+
+    fn decode(&self, id: &ObjectId, raw: &[u8]) -> Result<Vec<u8>> {
+        if !group::is_group(raw) {
+            return decode_verified(id, raw);
+        }
+        let body = Body::decode(raw).with_context(|| format!("object {id} is corrupt"))?;
+        let data = body
+            .chunk(|i, k| self.source_slot(&body.sources[i], k))
+            .with_context(|| format!("object {id} can't be decoded"))?;
+        if ObjectId::of(&data) != *id {
+            bail!("object {id} is corrupt (decodes to the wrong content)");
+        }
+        Ok(data)
+    }
+
+    /// Section `k` of group object `x`.
+    pub fn source_slot(&self, x: &ObjectId, k: u32) -> Result<Vec<u8>> {
+        let body = self.source_body(x)?;
+        body.slot(k).map(<[u8]>::to_vec).ok_or_else(|| anyhow!("object {x} has no section {k}"))
+    }
+
+    /// Group object `x`, decoded: the intact copy with the most sections. Copies of a
+    /// group object only ever add sections (`chunk_store.rs` repairs by appending), so
+    /// that copy holds every section any copy does.
+    pub fn source_body(&self, x: &ObjectId) -> Result<Arc<Body>> {
+        if let Some(b) = self.bodies.lock().unwrap().get(x) {
+            return Ok(b.clone());
+        }
+        let mut best: Option<Body> = None;
+        let mut err = None;
+        for loc in self.copies(x)? {
+            match self.read_loc(x, loc, usize::MAX).and_then(|raw| Body::decode(&raw)) {
+                Ok(b) if best.as_ref().is_none_or(|c| b.slots() > c.slots()) => best = Some(b),
+                Ok(_) => {}
+                Err(e) => err = Some(e),
+            }
+        }
+        let body = Arc::new(best.ok_or_else(|| {
+            err.unwrap_or_else(|| anyhow!("object {x} is not a group object")).context(format!("object {x}"))
+        })?);
+        let mut cache = self.bodies.lock().unwrap();
+        if cache.len() >= BODY_CACHE {
+            cache.clear();
+        }
+        cache.insert(*x, body.clone());
+        Ok(body)
+    }
+
+    /// The objects `id` reads sections from (any copy); empty for plain objects.
+    /// Reads only the start of each copy. `prune` keeps these alive along with `id`.
+    pub fn deps(&self, id: &ObjectId) -> Result<Vec<ObjectId>> {
+        let copies = self.index.read().unwrap().copies(id);
+        let mut out = Vec::new();
+        for loc in copies {
+            let head = self.read_loc(id, loc, group::MAX_HEADER_LEN)?;
+            if group::is_group(&head) {
+                out.extend(group::sources(&head).with_context(|| format!("object {id} is corrupt"))?);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// For a group object that decodes correctly: where each section it uses is stored
+    /// (section id → group object, slot), so a newer version of the chunk can point at
+    /// them. Everything returned was read back and hashed. `None` if no copy is a group
+    /// object that decodes.
+    pub fn group_locations(&self, id: &ObjectId) -> Option<Vec<(ObjectId, group::Location)>> {
+        for loc in self.copies(id).ok()? {
+            let Ok(raw) = self.read_loc(id, loc, usize::MAX) else { continue };
+            if !group::is_group(&raw) {
+                continue;
+            }
+            let Ok(body) = Body::decode(&raw) else { continue };
+            let mut out = Vec::new();
+            let decoded = body.chunk(|i, k| {
+                let x = body.sources[i];
+                let s = self.source_slot(&x, k)?;
+                out.push((ObjectId::of(&s), (x, k)));
+                Ok(s)
+            });
+            if !decoded.is_ok_and(|d| ObjectId::of(&d) == *id) {
+                continue;
+            }
+            out.extend((0..body.slots() as u32).map(|k| (ObjectId::of(body.slot(k).unwrap()), (*id, k))));
+            return Some(out);
+        }
+        None
     }
 
     /// All objects with their compressed size.
@@ -387,23 +618,30 @@ impl Repo {
 
     // -- garbage collection ------------------------------------------------------
 
-    /// Copy the `keep` objects out of `packs` into new packs (verifying each
-    /// one), make those durable, then delete the old packs. Needs the exclusive lock.
+    /// Copy the `keep` objects out of `packs` into new packs (checking each one), make
+    /// those durable, then delete the old packs. Needs the exclusive lock.
     /// Returns (new packs written, their total size).
+    ///
+    /// Where an object has several copies in `packs`, one is kept: the group copy with
+    /// the most sections (see [`Repo::source_body`]), else a plain one. A plain copy is
+    /// also kept unless some group copy of the object, anywhere, decodes correctly.
     pub fn repack(&self, packs: &[PackInfo], keep: &HashSet<ObjectId>) -> Result<(u64, u64)> {
-        let mut copied = HashSet::new();
+        let mut candidates: Vec<(ObjectId, Vec<Loc>)> = Vec::new();
+        let mut slot: HashMap<ObjectId, usize> = HashMap::new();
+        for p in packs {
+            for e in p.entries.iter().filter(|e| keep.contains(&e.id)) {
+                let i = *slot.entry(e.id).or_insert_with(|| {
+                    candidates.push((e.id, Vec::new()));
+                    candidates.len() - 1
+                });
+                candidates[i].1.push(Loc { pack: p.id, offset: e.offset, len: e.len });
+            }
+        }
         let mut b = Builder::default();
         let mut written = Vec::new();
-        for p in packs {
-            let f = self.handle(&p.id)?;
-            for e in &p.entries {
-                if !keep.contains(&e.id) || !copied.insert(e.id) {
-                    continue;
-                }
-                let mut raw = vec![0u8; e.len as usize];
-                pack::read_at(&f, &mut raw, e.offset)?;
-                decode_verified(&e.id, &raw).context("refusing to repack a damaged object")?;
-                b.add(e.id, &raw)?;
+        for (id, locs) in &candidates {
+            for raw in self.choose_copies(id, locs).context("refusing to repack a damaged object")? {
+                b.add(*id, &raw)?;
                 if b.data_len() >= self.config.pack_size {
                     written.push(self.write_pack(std::mem::take(&mut b))?);
                 }
@@ -424,17 +662,75 @@ impl Repo {
         Ok((written.len() as u64, bytes))
     }
 
-    pub fn delete_pack(&self, id: &ObjectId) -> Result<()> {
-        self.handles.lock().unwrap().remove(id);
-        fs::remove_file(self.pack_path(id)).with_context(|| format!("deleting pack {id}"))?;
-        let mut index = self.index.write().unwrap();
-        if let Some(info) = index.packs.remove(id) {
-            for e in info.entries {
-                if index.objects.get(&e.id).is_some_and(|l| l.pack == *id) {
-                    index.objects.remove(&e.id);
+    /// Which of an object's copies at `locs` repack keeps (see [`Repo::repack`]).
+    fn choose_copies(&self, id: &ObjectId, locs: &[Loc]) -> Result<Vec<Vec<u8>>> {
+        let mut best_group: Option<(usize, Vec<u8>)> = None;
+        let mut plain: Option<Vec<u8>> = None;
+        let mut err = None;
+        for &loc in locs {
+            let raw = self.read_loc(id, loc, usize::MAX)?;
+            if group::is_group(&raw) {
+                match Body::decode(&raw) {
+                    Ok(b) if best_group.as_ref().is_none_or(|(n, _)| b.slots() > *n) => {
+                        best_group = Some((b.slots(), raw))
+                    }
+                    Ok(_) => {}
+                    Err(e) => err = Some(e),
+                }
+            } else {
+                match decode_verified(id, &raw) {
+                    Ok(_) if plain.is_none() => plain = Some(raw),
+                    Ok(_) => {}
+                    Err(e) => err = Some(e),
                 }
             }
         }
+        let mut out = Vec::new();
+        if let Some((_, raw)) = best_group {
+            out.push(raw);
+        }
+        if let Some(raw) = plain {
+            // Drop the plain copy only if the chunk provably decodes from a group copy
+            // (here or in a pack that stays).
+            if self.get_group(id).is_err() {
+                out.push(raw);
+            } else if out.is_empty() {
+                return Ok(out);
+            }
+        }
+        if out.is_empty() {
+            return Err(err.unwrap_or_else(|| anyhow!("object {id} has no readable copy")));
+        }
+        Ok(out)
+    }
+
+    /// Decode `id` from a group copy only (plain copies don't count).
+    pub fn get_group(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        let mut err = anyhow!("object {id} has no group copy");
+        for loc in self.copies(id)? {
+            let raw = self.read_loc(id, loc, usize::MAX)?;
+            if group::is_group(&raw) {
+                match self.decode(id, &raw) {
+                    Ok(d) => return Ok(d),
+                    Err(e) => err = e,
+                }
+            }
+        }
+        Err(err)
+    }
+
+    /// Re-read every pack's index from disk (after a bulk rewrite like `migrate`).
+    pub fn reload_index(&mut self) -> Result<()> {
+        self.handles.lock().unwrap().clear();
+        self.bodies.lock().unwrap().clear();
+        self.load_index()
+    }
+
+    pub fn delete_pack(&self, id: &ObjectId) -> Result<()> {
+        self.handles.lock().unwrap().remove(id);
+        fs::remove_file(self.pack_path(id)).with_context(|| format!("deleting pack {id}"))?;
+        self.index.write().unwrap().remove_pack(id);
+        self.bodies.lock().unwrap().clear();
         Ok(())
     }
 

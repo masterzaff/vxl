@@ -7,7 +7,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use vxl::commands::{backup, compare, diff, list, partial, prune, restore, verify};
+use vxl::commands::{backup, compare, diff, list, migrate, partial, prune, restore, verify};
 use vxl::config::Config;
 use vxl::hooks::{self, Hooks};
 use vxl::repo::{self, LockMode, Repo};
@@ -89,6 +89,10 @@ enum Cmd {
         /// Target size of pack files, in MiB.
         #[arg(long, default_value_t = repo::DEFAULT_PACK_SIZE >> 20)]
         pack_size_mb: u64,
+        /// Storage format. 3 stores each chunk's unchanged sections only once, which makes
+        /// nightly backups several times smaller; older vxl versions can't read it.
+        #[arg(long, default_value_t = repo::DEFAULT_REPO_VERSION, value_parser = clap::value_parser!(u32).range(2..=3))]
+        format: u32,
     },
     /// Snapshot a world, or every world in a server folder, as one snapshot.
     /// Only new or changed chunks are stored.
@@ -208,6 +212,12 @@ enum Cmd {
         #[command(flatten)]
         repo: RepoArg,
     },
+    /// Convert a repository to storage format 3 (see `vxl init --format`). Snapshots and
+    /// their ids stay the same; old copies are removed only after the new ones check out.
+    Migrate {
+        #[command(flatten)]
+        repo: RepoArg,
+    },
     /// Check that every object a snapshot needs is present and intact.
     Verify {
         /// Snapshot to check: an id, `latest` or a time (default: all snapshots).
@@ -297,10 +307,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
         _ => Config::find(cli.config.as_deref())?.0,
     };
     match cli.cmd {
-        Cmd::Init { path, zstd_level, pack_size_mb } => {
+        Cmd::Init { path, zstd_level, pack_size_mb, format } => {
             let path = RepoArg { repo: path }.path(&cfg)?;
-            Repo::init(&path, zstd_level, pack_size_mb << 20)?;
-            println!("initialized empty vxl repository in {}", path.display());
+            Repo::init_format(&path, zstd_level, pack_size_mb << 20, format)?;
+            println!("initialized empty vxl repository (format {format}) in {}", path.display());
+        }
+
+        Cmd::Migrate { repo } => {
+            let mut repo = open(&repo, &cfg, LockMode::Exclusive)?;
+            let was = repo.config.version;
+            let pb = bar("converting", false);
+            let r = migrate::migrate(&mut repo, &pb)?;
+            pb.finish_and_clear();
+            println!(
+                "format {was} → 3: {} snapshots, {} chunks ({} converted, {} unchanged) | {} → {}",
+                r.snapshots,
+                thousands(r.chunks),
+                thousands(r.converted),
+                thousands(r.unchanged),
+                human_bytes(r.bytes_before),
+                human_bytes(r.bytes_after),
+            );
         }
 
         Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post, strict } => {

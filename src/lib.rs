@@ -4,6 +4,7 @@
 //! - [`anvil`]    : read/write region files (`r.X.Z.mca`), no knowledge of the repo
 //! - [`repo`]     : the on-disk repository and its content-addressed object store
 //! - [`pack`]     : the pack file format objects are stored in
+//! - [`group`], [`chunk_store`]: format 3, chunks stored as skeleton + sections
 //! - [`manifest`] : the snapshot format (what a backup *is*)
 //! - [`world`]    : finding worlds in a server folder, walking a world and classifying files
 //! - [`retention`]: which snapshots `prune` keeps (`--keep-daily` etc.)
@@ -15,8 +16,10 @@
 //! `main.rs` is just a thin CLI wrapper around this.
 
 pub mod anvil;
+pub mod chunk_store;
 pub mod commands;
 pub mod config;
+pub mod group;
 pub mod hooks;
 pub mod index_cache;
 pub mod manifest;

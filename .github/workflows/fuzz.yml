@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [region, chunk_payload, nbt, pack_index, index_cache]
+        target: [region, chunk_payload, nbt, pack_index, index_cache, group]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

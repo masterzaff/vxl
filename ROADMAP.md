@@ -123,7 +123,7 @@ snapshot, and a restore of it loads cleanly:
    before* it (not the nearest: a rollback should never pick a snapshot from after the
    moment asked for), refusing to guess across several sources.
 
-## Phase 3: storage format v3 (decided by data)
+## Phase 3: storage format v3 (decided by data) ✅
 
 *Goal: smaller repos, only with proven gains.*
 
@@ -154,12 +154,25 @@ Steps:
    night is ~3.5× smaller. Unpack adds another −5% at ~35% less throughput and the
    dictionary ~−10% with a repo-wide dependency; both are independent of the format
    change and left to measure on top of v3 once it exists.
-   Before building it, the format needs: section objects shared between grouped objects
-   (prune may only drop a grouped object when no live skeleton still points into it),
-   the id → (object, index) table for compact refs, and decode/verify through both.
-4. **`vxl migrate`** v2 → v3 (rewrite packs). Real repos exist now, so unlike v1 this
-   needs a proper migration.
-5. Optional: recompress at a higher zstd level during prune (~−10%, costs only prune time).
+4. ✅ **Format 3** (`src/group.rs`, `src/chunk_store.rs`). Older sections are referenced
+   by (object, slot) instead of a sequential id, so there is no repo-wide counter. Each
+   object's header lists the objects it reads from, and `prune` keeps those. Objects keep
+   their names, so manifests don't change. Packs are written in fill order, so a crash
+   never leaves an object without its sources. Through the real backup code on the same
+   copies (`examples/format_bench.rs`, manifests included): first backup +1.5%, changed
+   nights 32–56% of format 2, total 78%. The newest snapshot restores identical (130,789
+   chunks). Tests: random backup/delete/prune histories restore exactly after every
+   deletion; an object whose source is gone is never reused; mutation and fuzz targets
+   cover group objects.
+5. ✅ **`vxl migrate`** v2 → v3: adds a group copy of every chunk, checks every one, then
+   drops the old copies. Interruptible and resumable; snapshot ids unchanged. 31 s for the
+   7-copy repo, ending the same size as a native format-3 repo.
+6. Make format 3 the default after it has run on a real server for a while.
+7. **Manifests.** Each snapshot's manifest lists every chunk (~5 MB for 117k chunks), now
+   about half of a format-3 night. Next: store a region's chunk list as its own object, so
+   unchanged regions cost nothing.
+8. Measure unpack (~−5%) and a trained dictionary (~−10%) on top of format 3; optionally
+   recompress at a higher zstd level during prune.
 
 ## Phase 4: robustness and operations
 

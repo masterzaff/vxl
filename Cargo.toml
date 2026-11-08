@@ -22,3 +22,8 @@ zstd = "0.14.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Dependencies (zstd, BLAKE3, zlib, LZ4) optimized even in debug builds: tests do real
+# compression work and are several times faster, while vxl's own code stays debuggable.
+[profile.dev.package."*"]
+opt-level = 2

@@ -91,7 +91,7 @@ pub fn decode(main: &[u8], part: impl Fn(&ObjectId) -> Result<Vec<u8>>) -> Resul
 }
 
 /// The sections list: `sections` (1.18+) or `Level.Sections` (older worlds).
-fn sections_mut(root: &mut Tag, elem: u8) -> Option<&mut Tag> {
+pub(crate) fn sections_mut(root: &mut Tag, elem: u8) -> Option<&mut Tag> {
     let is_list = |t: &Tag| matches!(t, Tag::List(e, _) if *e == elem);
     if root.get("sections").is_some_and(is_list) {
         return root.get_mut("sections");

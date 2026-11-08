@@ -6,8 +6,9 @@
 use std::fs;
 
 use vxl::anvil::{self, Compression, RawChunk};
+use vxl::repo::ObjectId;
 use vxl::repo::{LockMode, Repo};
-use vxl::{nbt, pack, synth};
+use vxl::{group, nbt, pack, synth};
 
 struct Rng(u64);
 
@@ -164,4 +165,28 @@ fn pack_files() {
     fs::write(&pack_path, bad).unwrap();
     let repo = Repo::open(&repo_dir, LockMode::Shared).unwrap();
     assert!(!repo.warnings.is_empty());
+}
+
+#[test]
+fn group_objects() {
+    // A chunk that reads some sections from an older object, so both the header and the
+    // references have something to damage.
+    let a = synth::chunk_nbt(1, 2, 3, 0);
+    let old = group::encode(&a, group::split(&a).unwrap(), None, |_| None, 3).unwrap();
+    let ia = ObjectId::of(&a);
+    let slots: std::collections::HashMap<ObjectId, u32> =
+        old.new.iter().enumerate().map(|(k, s)| (*s, k as u32)).collect();
+    let b = synth::chunk_nbt(1, 2, 3, 40);
+    let e =
+        group::encode(&b, group::split(&b).unwrap(), None, |s| slots.get(s).map(|&k| (ia, k)), 3).unwrap();
+    assert_eq!(e.sources, [ia]);
+    let source = group::Body::decode(&old.stored).unwrap();
+    let mut rng = Rng(0x005E_ED0F_6A0C);
+    for _ in 0..ROUNDS {
+        let m = mutate(&e.stored, &mut rng);
+        let _ = group::sources(&m);
+        if let Ok(body) = group::Body::decode(&m) {
+            let _ = body.chunk(|_, k| Ok(source.slot(k).unwrap_or_default().to_vec()));
+        }
+    }
 }

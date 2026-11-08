@@ -9,6 +9,8 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 
 use crate::anvil;
+use crate::chunk_store::ChunkStore;
+use crate::commands::list::list;
 use crate::hooks::check_interrupted;
 use crate::manifest::{ChunkEntry, FORMAT_VERSION, FileEntry, Snapshot, SnapshotHeader, Stats, World};
 use crate::repo::{ObjectId, Repo};
@@ -46,6 +48,53 @@ struct Done {
     torn: bool,
 }
 
+/// Format 3: what's needed to store chunks as group objects.
+struct Grouped<'a> {
+    store: ChunkStore<'a>,
+    /// (world, region file) → slot → the chunk's object in the latest snapshot of this source.
+    prev: HashMap<(String, String), HashMap<u16, ObjectId>>,
+}
+
+impl Grouped<'_> {
+    fn prev(&self, world: &str, path: &str, slot: u16) -> Option<&ObjectId> {
+        self.prev.get(&(world.to_string(), path.to_string()))?.get(&slot)
+    }
+}
+
+/// Read the latest snapshot of every source: its chunk objects can be reused unchecked,
+/// and this source's tell each chunk where its previous version is.
+fn grouped<'a>(repo: &'a Repo, source: &str, warnings: &mut Vec<String>) -> Result<Option<Grouped<'a>>> {
+    if !repo.grouped() {
+        return Ok(None);
+    }
+    let mut latest: HashMap<String, ObjectId> = HashMap::new();
+    for (id, h) in list(repo)? {
+        latest.entry(h.source).or_insert(id); // newest first
+    }
+    let mut trusted = HashSet::new();
+    let mut prev = HashMap::new();
+    for (src, id) in latest {
+        let snap = match repo.load_snapshot(&id) {
+            Ok(s) => s,
+            Err(e) => {
+                warnings.push(format!("can't read the latest snapshot of {src}: {e:#}"));
+                continue;
+            }
+        };
+        for w in snap.worlds {
+            for f in w.files {
+                let FileEntry::Region { path, chunks } = f else { continue };
+                let live: Vec<&ChunkEntry> = chunks.iter().filter(|c| !c.verbatim).collect();
+                trusted.extend(live.iter().map(|c| c.hash));
+                if src == source {
+                    prev.insert((w.name.clone(), path), live.iter().map(|c| (c.slot, c.hash)).collect());
+                }
+            }
+        }
+    }
+    Ok(Some(Grouped { store: ChunkStore::new(repo, trusted), prev }))
+}
+
 /// Back up the worlds under `source` (or `source` itself, if it is a world) that
 /// `opts.worlds` pick as one snapshot.
 pub fn backup(repo: &Repo, source: &Path, opts: &Options, progress: &ProgressBar) -> Result<BackupReport> {
@@ -64,10 +113,11 @@ pub fn backup(repo: &Repo, source: &Path, opts: &Options, progress: &ProgressBar
 
     let mut stats = Stats::default();
     let mut warnings = Vec::new();
+    let g = grouped(repo, &source_abs.display().to_string(), &mut warnings)?;
     let mut torn = 0;
     let mut worlds = Vec::with_capacity(selected.len());
     for (w, scan) in selected.iter().zip(scans) {
-        let (files, s) = backup_world(repo, scan, progress, &mut warnings, &mut torn, &w.name)?;
+        let (files, s) = backup_world(repo, g.as_ref(), scan, progress, &mut warnings, &mut torn, &w.name)?;
         add(&mut stats, &s);
         worlds.push(World { name: w.name.clone(), path: w.rel.clone(), stats: s, files });
     }
@@ -110,6 +160,7 @@ fn add(total: &mut Stats, s: &Stats) {
 /// Store one world's files. Warnings are prefixed with `<world>/<path>`.
 fn backup_world(
     repo: &Repo,
+    g: Option<&Grouped>,
     scan: Scan,
     progress: &ProgressBar,
     warnings: &mut Vec<String>,
@@ -126,7 +177,7 @@ fn backup_world(
         .map(|f| {
             check_interrupted()?;
             let r = match f.kind {
-                Kind::Region { coords } => backup_region(repo, f, coords),
+                Kind::Region { coords } => backup_region(repo, g, name, f, coords),
                 _ => backup_blob(repo, f),
             };
             progress.inc(f.size);
@@ -263,15 +314,22 @@ enum ReadRegion {
     },
 }
 
+struct RegionAt<'a> {
+    world: &'a str,
+    rel: &'a str,
+    path: &'a Path,
+}
+
 fn read_region(
     repo: &Repo,
-    path: &Path,
+    g: Option<&Grouped>,
+    at: &RegionAt,
     coords: (i32, i32),
     stored: &mut HashMap<ObjectId, u64>,
 ) -> Result<Attempt<ReadRegion>> {
-    let (data, unchanged) = read_once(path)?;
+    let (data, unchanged) = read_once(at.path)?;
     let fingerprint = ObjectId::of(&data);
-    let dir = path.parent().unwrap();
+    let dir = at.path.parent().unwrap();
     let parsed = match anvil::parse_region(&data, Some(coords), |name| fs::read(dir.join(name))) {
         Ok(p) => p,
         Err(e) => {
@@ -295,7 +353,10 @@ fn read_region(
                     (c.payload, true, Some(format!("chunk ({x},{z}): {e}; kept its raw bytes")))
                 }
             };
-            let put = repo.put(&bytes)?;
+            let put = match g {
+                Some(g) if !verbatim => g.store.put(&bytes, g.prev(at.world, at.rel, c.slot))?,
+                _ => repo.put(&bytes)?,
+            };
             let entry =
                 ChunkEntry { slot: c.slot, ts: c.timestamp, comp: c.compression, hash: put.id, verbatim };
             Ok((entry, put.stored, warn))
@@ -321,11 +382,18 @@ fn read_region(
     Ok(Attempt { value, unchanged, suspect, fingerprint })
 }
 
-fn backup_region(repo: &Repo, f: &WorldFile, coords: (i32, i32)) -> Result<Done> {
+fn backup_region(
+    repo: &Repo,
+    g: Option<&Grouped>,
+    world: &str,
+    f: &WorldFile,
+    coords: (i32, i32),
+) -> Result<Done> {
     // Objects this file's reads added to the repo (any attempt), with their stored size.
     let mut stored = HashMap::new();
+    let at = RegionAt { world, rel: &f.rel, path: &f.abs };
     let (read, tries, settled) =
-        settle(|| read_region(repo, &f.abs, coords, &mut stored), READ_ATTEMPTS, RETRY_DELAY)?;
+        settle(|| read_region(repo, g, &at, coords, &mut stored), READ_ATTEMPTS, RETRY_DELAY)?;
     let mut warnings = Vec::new();
     if !settled {
         warnings.push(torn_warning(tries));

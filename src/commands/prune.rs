@@ -56,6 +56,27 @@ pub fn delete(repo: &Repo, ids: &[ObjectId], dry_run: bool) -> Result<PruneRepor
     collect(repo, &snaps, &ids.iter().copied().collect(), dry_run)
 }
 
+/// Add what group objects in `live` read sections from (format 3; one level is enough,
+/// since a section is read straight out of the object that stores it). Bails rather
+/// than guess if an object's header can't be read; an object that's missing altogether
+/// has nothing left to protect.
+pub fn with_deps(repo: &Repo, live: HashSet<ObjectId>) -> Result<HashSet<ObjectId>> {
+    if !repo.grouped() {
+        return Ok(live);
+    }
+    let deps: Vec<ObjectId> = live
+        .par_iter()
+        .filter(|id| repo.has(id))
+        .map(|id| repo.deps(id).context("refusing to garbage-collect"))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut live = live;
+    live.extend(deps);
+    Ok(live)
+}
+
 /// Remove the snapshots in `remove` (of `snaps`, newest first) and collect garbage.
 fn collect(
     repo: &Repo,
@@ -77,6 +98,7 @@ fn collect(
         .into_iter()
         .flatten()
         .collect();
+    let live = with_deps(repo, live)?;
 
     let mut report = PruneReport {
         removed_snapshots: removed.iter().map(|(id, _)| *id).collect(),
