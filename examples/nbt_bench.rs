@@ -12,11 +12,15 @@
 //!   ...+light        also expand light nibbles
 //!   grouped split    split for dedup, but a chunk's skeleton and its *new* sections
 //!                    are compressed together as one object (keeps zstd's context)
+//!   ...+compact      grouped, with section references in the skeleton shortened from
+//!                    a 32-byte hash to "#n in this object" (sections stored alongside)
+//!                    or a sequential id (sections stored earlier). Dedup still keys on
+//!                    the full skeleton, so what counts as unchanged is the same.
 //!
 //! Every transformed chunk is verified to decode byte-identically; chunks that
 //! don't are counted as fallbacks and stored whole.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -43,7 +47,11 @@ struct Method {
     codec: Option<Codec>,
     /// Compress skeleton + new sections as one object instead of separately.
     grouped: bool,
+    /// (grouped only) store section references compactly instead of as hashes.
+    compact: bool,
     seen: Mutex<HashSet<ObjectId>>,
+    /// (compact only) sequential id of every stored section.
+    section_ids: Mutex<HashMap<ObjectId, u32>>,
     /// stored bytes per version
     per_version: Mutex<Vec<u64>>,
     current: AtomicU64,
@@ -57,11 +65,17 @@ struct Method {
 
 impl Method {
     fn new(name: &'static str, codec: Option<Codec>, grouped: bool) -> Self {
+        Self::with(name, codec, grouped, false)
+    }
+
+    fn with(name: &'static str, codec: Option<Codec>, grouped: bool, compact: bool) -> Self {
         Method {
             name,
             codec,
             grouped,
+            compact,
             seen: Mutex::default(),
+            section_ids: Mutex::default(),
             per_version: Mutex::default(),
             current: AtomicU64::new(0),
             main_bytes: AtomicU64::new(0),
@@ -90,15 +104,32 @@ impl Method {
         if !self.seen.lock().unwrap().insert(ObjectId::of(&enc.main)) {
             return;
         }
-        let mut buf = enc.main.clone();
+        let mut sections = Vec::new();
+        let mut local = 0u32; // sections stored in this object so far
+        let mut refs: Vec<(ObjectId, Vec<u8>)> = Vec::new(); // hash → compact reference
         for p in &enc.parts {
             self.parts_total.fetch_add(1, Relaxed);
-            if self.seen.lock().unwrap().insert(ObjectId::of(p)) {
-                buf.extend_from_slice(&(p.len() as u32).to_le_bytes());
-                buf.extend_from_slice(p);
+            let id = ObjectId::of(p);
+            let mut seen = self.seen.lock().unwrap();
+            if seen.insert(id) {
+                if self.compact {
+                    let mut ids = self.section_ids.lock().unwrap();
+                    let next = ids.len() as u32;
+                    ids.insert(id, next);
+                    refs.push((id, compact_ref(0, local)));
+                }
+                sections.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                sections.extend_from_slice(p);
+                local += 1;
                 self.parts_new.fetch_add(1, Relaxed);
+            } else if self.compact {
+                let gid = self.section_ids.lock().unwrap()[&id];
+                refs.push((id, compact_ref(1, gid)));
             }
         }
+        let main = if self.compact { shorten_refs(&enc.main, &refs) } else { enc.main.clone() };
+        let mut buf = main;
+        buf.extend_from_slice(&sections);
         let n = zstd::bulk::compress(&buf, ZSTD_LEVEL).unwrap().len() as u64;
         self.current.fetch_add(n, Relaxed);
         self.main_bytes.fetch_add(n, Relaxed);
@@ -134,6 +165,37 @@ impl Method {
     fn end_version(&self) {
         self.per_version.lock().unwrap().push(self.current.swap(0, Relaxed));
     }
+}
+
+/// A compact section reference: kind (0 = n-th section in this object, 1 = section
+/// with this sequential id, stored earlier) + varint.
+fn compact_ref(kind: u8, mut n: u32) -> Vec<u8> {
+    let mut out = vec![kind];
+    loop {
+        let b = (n & 0x7F) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(b);
+            return out;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+/// Replace each `ByteArray(32 bytes = hash)` section reference in a skeleton with the
+/// compact one (length prefix included), as a real format would store it.
+fn shorten_refs(main: &[u8], refs: &[(ObjectId, Vec<u8>)]) -> Vec<u8> {
+    let mut out = main.to_vec();
+    for (id, r) in refs {
+        let mut pat = 32u32.to_be_bytes().to_vec();
+        pat.extend_from_slice(&id.0);
+        if let Some(pos) = out.windows(pat.len()).position(|w| w == pat) {
+            let mut rep = (r.len() as u32).to_be_bytes().to_vec();
+            rep.extend_from_slice(r);
+            out.splice(pos..pos + pat.len(), rep);
+        }
+    }
+    out
 }
 
 fn mix(mut x: u64) -> u64 {
@@ -238,6 +300,8 @@ fn main() {
         Method::new("split+unpack", c(true, true, false), false),
         Method::new("grouped split", c(true, false, false), true),
         Method::new("grouped split+unpack", c(true, true, false), true),
+        Method::with("grouped+compact", c(true, false, false), true, true),
+        Method::with("grouped+unpack+compact", c(true, true, false), true, true),
     ];
 
     let mut raw_total = 0u64;
