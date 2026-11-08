@@ -166,10 +166,13 @@ mod tests {
     fn relative_paths_are_relative_to_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("vxl.toml");
-        fs::write(&p, "source = \"server\"\nrepo = \"/abs/repo\"").unwrap();
+        // Absolute on every platform (`/abs` isn't on Windows: no drive letter).
+        let abs = dir.path().join("elsewhere").join("repo");
+        let toml_str = |p: &Path| p.display().to_string().replace('\\', "\\\\");
+        fs::write(&p, format!("source = \"server\"\nrepo = \"{}\"", toml_str(&abs))).unwrap();
         let c = Config::load(&p).unwrap();
         assert_eq!(c.source.unwrap(), dir.path().join("server"));
-        assert_eq!(c.repo.unwrap(), Path::new("/abs/repo"));
+        assert_eq!(c.repo.unwrap(), abs);
     }
 
     #[test]
