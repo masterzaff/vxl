@@ -10,6 +10,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use vxl::commands::{backup, compare, list, prune, restore, verify};
 use vxl::hooks::{self, Hooks};
 use vxl::repo::{self, LockMode, Repo};
+use vxl::retention::Policy;
 use vxl::util::{human_bytes, thousands};
 
 /// Differential, deduplicating backups for Minecraft Java worlds.
@@ -25,6 +26,41 @@ struct RepoArg {
     /// Path to the vxl repository.
     #[arg(long, short = 'r', env = "VXL_REPO")]
     repo: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct KeepArgs {
+    /// Keep the newest N snapshots.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_last: Option<u32>,
+    /// Keep the newest snapshot of each of the last N hours that have one.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_hourly: Option<u32>,
+    /// Keep the newest snapshot of each of the last N days that have one.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_daily: Option<u32>,
+    /// Keep the newest snapshot of each of the last N (ISO) weeks that have one.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_weekly: Option<u32>,
+    /// Keep the newest snapshot of each of the last N months that have one.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_monthly: Option<u32>,
+    /// Keep the newest snapshot of each of the last N years that have one.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    keep_yearly: Option<u32>,
+}
+
+impl KeepArgs {
+    fn policy(&self) -> Policy {
+        Policy {
+            last: self.keep_last,
+            hourly: self.keep_hourly,
+            daily: self.keep_daily,
+            weekly: self.keep_weekly,
+            monthly: self.keep_monthly,
+            yearly: self.keep_yearly,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -100,11 +136,25 @@ enum Cmd {
         #[command(flatten)]
         repo: RepoArg,
     },
-    /// Delete old snapshots and garbage-collect unreferenced data.
+    /// Delete snapshots a retention policy doesn't keep, and garbage-collect unreferenced data.
+    ///
+    /// A snapshot is kept if any --keep-* rule keeps it. Rules apply separately to each
+    /// source (folder + worlds) in the repo, and periods are in local time. Without any
+    /// rule, nothing is deleted and only garbage is collected.
     Prune {
-        /// Keep this many most recent snapshots. Without it, only garbage is collected.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        keep_last: Option<u64>,
+        #[command(flatten)]
+        keep: KeepArgs,
+        /// Show what would be deleted (and why the rest is kept) without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        repo: RepoArg,
+    },
+    /// Delete specific snapshots and garbage-collect what only they used.
+    Delete {
+        /// Snapshot ids (any unique prefix).
+        #[arg(required = true)]
+        snapshots: Vec<String>,
         /// Show what would be deleted without deleting anything.
         #[arg(long)]
         dry_run: bool,
@@ -168,6 +218,29 @@ fn open(r: &RepoArg, lock: LockMode) -> Result<Repo> {
     let repo = Repo::open(&r.repo, lock)?;
     print_warnings(&repo.warnings);
     Ok(repo)
+}
+
+fn print_removal(r: &prune::PruneReport, dry_run: bool) {
+    let verb = if dry_run { "would remove" } else { "removed" };
+    for id in &r.removed_snapshots {
+        println!("{verb} snapshot {}", short(id, 6));
+    }
+    println!(
+        "{verb} {} snapshots, kept {} | {} {} objects | {} {} packs, {} {} | {} {}",
+        r.removed_snapshots.len(),
+        r.kept_snapshots,
+        if dry_run { "would delete" } else { "deleted" },
+        thousands(r.deleted_objects),
+        if dry_run { "would drop" } else { "dropped" },
+        r.packs_deleted,
+        if dry_run { "would repack" } else { "repacked" },
+        r.packs_repacked,
+        if dry_run { "would free" } else { "freed" },
+        human_bytes(r.freed_bytes),
+    );
+    if r.garbage_left > 0 {
+        println!("({} unused objects stay in packs that are mostly still in use)", thousands(r.garbage_left));
+    }
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
@@ -305,32 +378,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
             );
         }
 
-        Cmd::Prune { keep_last, dry_run, repo } => {
+        Cmd::Prune { keep, dry_run, repo } => {
             let repo = open(&repo, LockMode::Exclusive)?;
-            let r = prune::prune(&repo, keep_last.map(|n| n as usize), dry_run)?;
-            let verb = if dry_run { "would remove" } else { "removed" };
-            for id in &r.removed_snapshots {
-                println!("{verb} snapshot {}", short(id, 6));
+            let r = prune::prune(&repo, &keep.policy(), dry_run)?;
+            if dry_run {
+                for (id, why) in &r.kept_by {
+                    let why: Vec<&str> = why.iter().map(|p| p.name()).collect();
+                    println!("would keep   {} ({})", short(id, 6), why.join(", "));
+                }
             }
-            println!(
-                "{verb} {} snapshots, kept {} | {} {} objects | {} {} packs, {} {} | {} {}",
-                r.removed_snapshots.len(),
-                r.kept_snapshots,
-                if dry_run { "would delete" } else { "deleted" },
-                thousands(r.deleted_objects),
-                if dry_run { "would drop" } else { "dropped" },
-                r.packs_deleted,
-                if dry_run { "would repack" } else { "repacked" },
-                r.packs_repacked,
-                if dry_run { "would free" } else { "freed" },
-                human_bytes(r.freed_bytes),
-            );
-            if r.garbage_left > 0 {
-                println!(
-                    "({} unused objects stay in packs that are mostly still in use)",
-                    thousands(r.garbage_left)
-                );
-            }
+            print_removal(&r, dry_run);
+        }
+
+        Cmd::Delete { snapshots, dry_run, repo } => {
+            let repo = open(&repo, LockMode::Exclusive)?;
+            let ids = snapshots.iter().map(|s| repo.resolve(s)).collect::<Result<Vec<_>>>()?;
+            let r = prune::delete(&repo, &ids, dry_run)?;
+            print_removal(&r, dry_run);
         }
 
         Cmd::Compare { a, b } => {

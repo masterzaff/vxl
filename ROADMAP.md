@@ -89,10 +89,11 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
    which files get chunk-level dedup (Anvil `.mca`/`.mcc`) and which are stored whole.
 5. **Config file (`vxl.toml`).** Source, repo, hooks and retention in one place, so plain
    `vxl backup` does everything. README gets cron and systemd-timer examples.
-6. **`vxl delete <id>…`.** Delete specific snapshots and garbage-collect in one step,
+6. ✅ **`vxl delete <id>…`.** Delete specific snapshots and garbage-collect in one step,
    under the repo lock. (Today: remove `snapshots/<id>.json.zst`, then `vxl prune`.)
-7. **Retention policies.** `--keep-last 5 --keep-daily 7 --keep-weekly 4 --keep-monthly 6`,
-   set once in the config.
+7. ✅ **Retention policies.** `--keep-last 5 --keep-daily 7 --keep-weekly 4 --keep-monthly 6`
+   (also hourly, yearly), set once in the config. Like restic: newest snapshot per period,
+   periods without snapshots don't count, local time, applied per source (folder + worlds).
 
 **Done when:** each of these gets backed up nightly by cron, all dimensions in one
 snapshot, and a restore of it loads cleanly:

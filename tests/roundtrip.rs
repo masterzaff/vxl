@@ -10,6 +10,7 @@ use tempfile::TempDir;
 use vxl::anvil::{self, Compression, RawChunk};
 use vxl::commands::{backup, list, prune, restore, verify};
 use vxl::repo::{LockMode, ObjectId, Repo};
+use vxl::retention::Policy;
 use vxl::synth;
 use vxl::world::{self, Kind};
 
@@ -68,6 +69,10 @@ fn setup() -> Env {
 
 fn repo(env: &Env) -> Repo {
     Repo::open(&env.repo_dir, LockMode::Exclusive).unwrap()
+}
+
+fn keep_last(n: u32) -> Policy {
+    Policy { last: Some(n), ..Default::default() }
 }
 
 fn hidden() -> ProgressBar {
@@ -223,13 +228,13 @@ fn prune_keeps_what_is_needed() {
     }
     let objects_before = repo(&env).list_objects().len();
 
-    let dry = prune::prune(&repo(&env), Some(2), true).unwrap();
+    let dry = prune::prune(&repo(&env), &keep_last(2), true).unwrap();
     assert_eq!(dry.removed_snapshots.len(), 2);
     assert_eq!(repo(&env).list_objects().len(), objects_before);
 
     let packs_before = repo(&env).packs();
     let disk_before: u64 = packs_before.iter().map(|p| p.size).sum();
-    let r = prune::prune(&repo(&env), Some(2), false).unwrap();
+    let r = prune::prune(&repo(&env), &keep_last(2), false).unwrap();
     assert_eq!(r.removed_snapshots, dry.removed_snapshots);
     assert!(r.deleted_objects > 0 && r.freed_bytes > 0);
     assert!(r.packs_repacked + r.packs_deleted > 0, "{r:?}");
@@ -247,7 +252,7 @@ fn prune_keeps_what_is_needed() {
     assert!(repo(&env).resolve(&ids[0].hex()[..8]).is_err());
 
     // A second prune finds nothing.
-    let again = prune::prune(&repo(&env), Some(2), false).unwrap();
+    let again = prune::prune(&repo(&env), &keep_last(2), false).unwrap();
     assert_eq!(again.deleted_objects, 0);
     assert_eq!(again.packs_deleted, 0);
 }
@@ -424,7 +429,7 @@ fn packs_from_a_crashed_backup_are_collected() {
     }
     assert!(repo(&env).packs().len() > good_packs);
 
-    let p = prune::prune(&repo(&env), None, false).unwrap();
+    let p = prune::prune(&repo(&env), &Policy::default(), false).unwrap();
     assert_eq!(p.deleted_objects, 50);
     assert_eq!(repo(&env).packs().len(), good_packs);
     let v = verify::verify(&repo(&env), &[id], &hidden()).unwrap();
@@ -737,4 +742,74 @@ fn cli_hooks_survive_sigint() {
     let log = fs::read_to_string(s.join("hooks.log")).unwrap();
     assert_eq!(log.lines().collect::<Vec<_>>(), ["pre", "post interrupted"]);
     assert!(list::list(&Repo::open(&repo, LockMode::None).unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn delete_removes_exactly_those_snapshots() {
+    let env = setup();
+    let mut ids = vec![];
+    for round in 0..3u32 {
+        let edit = move |cx: i32, _cz: i32| if cx == round as i32 { round + 1 } else { 0 };
+        synth::write_world(&env.world, 70, &[(0, 0)], 40, Compression::Zlib, edit).unwrap();
+        ids.push(do_backup(&env, &format!("round {round}")).id);
+    }
+    let objects_before = repo(&env).list_objects().len();
+
+    let dry = prune::delete(&repo(&env), &[ids[1]], true).unwrap();
+    assert_eq!(dry.removed_snapshots, [ids[1]]);
+    assert_eq!(repo(&env).snapshot_ids().unwrap().len(), 3);
+
+    let r = prune::delete(&repo(&env), &[ids[1]], false).unwrap();
+    assert_eq!(r.removed_snapshots, [ids[1]]);
+    assert_eq!(r.kept_snapshots, 2);
+    // Round 1's edited chunk was used only by that snapshot.
+    assert!(r.deleted_objects >= 1, "{r:?}");
+    let mut left = repo(&env).snapshot_ids().unwrap();
+    left.sort();
+    let mut want = vec![ids[0], ids[2]];
+    want.sort();
+    assert_eq!(left, want);
+    assert!(verify::verify(&repo(&env), &want, &hidden()).unwrap().problems.is_empty());
+    assert!(repo(&env).list_objects().len() < objects_before);
+}
+
+#[test]
+fn cli_prune_policies_and_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let world = tmp.path().join("world");
+    let repo = tmp.path().join("repo");
+    let vxl = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_vxl")).args(args).env("VXL_REPO", &repo).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    vxl(&["init", repo.to_str().unwrap()]);
+    let mut ids = vec![];
+    for round in 0..4u32 {
+        let edit = move |cx: i32, _cz: i32| if cx == round as i32 { round + 1 } else { 0 };
+        synth::write_world(&world, 71, &[(0, 0)], 10, Compression::Zlib, edit).unwrap();
+        let out = vxl(&["backup", world.to_str().unwrap()]);
+        ids.push(out["snapshot ".len()..][..6].to_string());
+    }
+
+    // All four were made today: keep-daily 1 keeps only the newest, keep-last 2 one more.
+    let out = vxl(&["prune", "--keep-daily", "1", "--keep-last", "2", "--dry-run"]);
+    assert!(out.contains(&format!("would keep   {} (last, daily)", ids[3])), "{out}");
+    assert!(out.contains(&format!("would keep   {} (last)", ids[2])), "{out}");
+    assert!(out.contains(&format!("would remove snapshot {}", ids[0])), "{out}");
+    assert!(out.contains("would remove 2 snapshots, kept 2"), "{out}");
+
+    let out = vxl(&["delete", &ids[0], &ids[1]]);
+    assert!(out.contains("removed 2 snapshots, kept 2"), "{out}");
+    let listing = vxl(&["list"]);
+    assert!(!listing.contains(&ids[0]) && listing.contains(&ids[3]), "{listing}");
+
+    // Without rules, prune deletes nothing.
+    assert!(vxl(&["prune"]).contains("removed 0 snapshots, kept 2"));
+    let bad = Command::new(env!("CARGO_BIN_EXE_vxl"))
+        .args(["delete", "zzzz"])
+        .env("VXL_REPO", &repo)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
 }

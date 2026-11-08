@@ -6,6 +6,7 @@
 //! - [`pack`]     : the pack file format objects are stored in
 //! - [`manifest`] : the snapshot format (what a backup *is*)
 //! - [`world`]    : finding worlds in a server folder, walking a world and classifying files
+//! - [`retention`]: which snapshots `prune` keeps (`--keep-daily` etc.)
 //! - [`hooks`]    : pre/post shell commands around a backup, Ctrl-C handling
 //! - [`nbt`], [`transform`]: byte-exact NBT + experimental reversible chunk transforms
 //! - [`commands`] : the actual `init/backup/list/restore/prune/verify` logic
@@ -19,6 +20,7 @@ pub mod manifest;
 pub mod nbt;
 pub mod pack;
 pub mod repo;
+pub mod retention;
 pub mod transform;
 pub mod util;
 pub mod world;

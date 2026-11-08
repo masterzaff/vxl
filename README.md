@@ -23,7 +23,7 @@ a91e07  2026-11-07 03:00  nightly               +6.1 MB
 
 $ vxl restore a91e07 ~/restored-world --repo /backups/survival-repo
 $ vxl verify --repo /backups/survival-repo
-$ vxl prune --keep-last 10 --repo /backups/survival-repo
+$ vxl prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --repo /backups/survival-repo
 ```
 
 Set `VXL_REPO=/backups/survival-repo` to skip `--repo` every time.
@@ -44,9 +44,37 @@ cargo install --path .
 | `restore <id> <folder> [-w world] [--force \| --force-wipe]` | rebuild a snapshot (or one world of it) into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
 | `compare <a> <b>` | compare two world folders chunk by chunk (e.g. original vs restored) and check `b`'s region files are laid out so Minecraft can read them |
-| `prune [--keep-last N] [--dry-run]` | drop old snapshots, delete/compact packs holding data nothing references |
+| `prune [--keep-last/hourly/daily/weekly/monthly/yearly N]… [--dry-run]` | drop snapshots no rule keeps, delete/compact packs holding data nothing references (see below) |
+| `delete <id>… [--dry-run]` | drop exactly these snapshots and collect the data only they used |
 
 Snapshot ids can be shortened to any unique prefix, like git.
+
+## Retention
+
+`prune` keeps a snapshot if any rule keeps it:
+
+| rule | keeps |
+|---|---|
+| `--keep-last N` | the newest N snapshots |
+| `--keep-hourly N` | the newest snapshot of each of the last N hours that have one |
+| `--keep-daily N` | … of each of the last N days |
+| `--keep-weekly N` | … of each of the last N weeks (ISO weeks, Monday to Sunday) |
+| `--keep-monthly N` | … of each of the last N months |
+| `--keep-yearly N` | … of each of the last N years |
+
+Days, weeks etc. are in local time, and periods without a snapshot don't count, so a server
+that was off for a week still keeps 7 *backed-up* days. Rules apply to each source on its own
+(the folder backed up, plus which worlds), so one repo can hold several servers without one
+crowding out another. Without any rule, `prune` deletes no snapshots and only collects garbage.
+`--dry-run` shows what would go and which rules keep the rest:
+
+```console
+$ vxl prune --keep-daily 7 --keep-weekly 4 --dry-run
+would keep   3f2a9c (daily, weekly)
+would keep   a91e07 (daily)
+…
+would remove snapshot 5c0d22
+```
 
 ## Restoring over an existing world
 

@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use rayon::prelude::*;
 
 use crate::commands::list::list;
+use crate::manifest::SnapshotHeader;
 use crate::repo::{ObjectId, PackInfo, Repo};
+use crate::retention::{self, Period, Policy};
 
 /// Repack a pack once at least this fraction of its object data is garbage.
 pub const REPACK_DEAD_FRACTION: f64 = 0.25;
@@ -14,8 +17,11 @@ const SMALL_DIVISOR: u64 = 4;
 
 #[derive(Debug, Default)]
 pub struct PruneReport {
+    /// Newest first.
     pub removed_snapshots: Vec<ObjectId>,
     pub kept_snapshots: usize,
+    /// For `prune`: each kept snapshot and the rules that keep it, newest first.
+    pub kept_by: Vec<(ObjectId, Vec<Period>)>,
     /// Unreferenced objects removed from disk.
     pub deleted_objects: u64,
     /// Unreferenced objects left in packs that are still mostly in use
@@ -31,13 +37,33 @@ pub struct PruneReport {
     pub freed_bytes: u64,
 }
 
-/// Drop all but the newest `keep_last` snapshots (all kept if `None`), then
-/// garbage-collect: delete packs nothing uses, compact packs that are mostly
-/// garbage or tiny. Needs the exclusive lock.
-pub fn prune(repo: &Repo, keep_last: Option<usize>, dry_run: bool) -> Result<PruneReport> {
+/// Drop the snapshots `policy` doesn't keep (an empty policy keeps all), then collect
+/// garbage: delete packs nothing uses, compact packs that are mostly garbage or tiny.
+/// Periods are in local time. Needs the exclusive lock.
+pub fn prune(repo: &Repo, policy: &Policy, dry_run: bool) -> Result<PruneReport> {
     let snaps = list(repo)?; // newest first
-    let keep = keep_last.unwrap_or(usize::MAX).min(snaps.len());
-    let (kept, removed) = snaps.split_at(keep);
+    let decisions = retention::apply(policy, &snaps, &Local);
+    let remove: HashSet<ObjectId> = decisions.iter().filter(|d| d.kept_by.is_empty()).map(|d| d.id).collect();
+    let mut report = collect(repo, &snaps, &remove, dry_run)?;
+    report.kept_by =
+        decisions.into_iter().filter(|d| !d.kept_by.is_empty()).map(|d| (d.id, d.kept_by)).collect();
+    Ok(report)
+}
+
+/// Delete exactly these snapshots, then collect garbage like [`prune`].
+pub fn delete(repo: &Repo, ids: &[ObjectId], dry_run: bool) -> Result<PruneReport> {
+    let snaps = list(repo)?;
+    collect(repo, &snaps, &ids.iter().copied().collect(), dry_run)
+}
+
+/// Remove the snapshots in `remove` (of `snaps`, newest first) and collect garbage.
+fn collect(
+    repo: &Repo,
+    snaps: &[(ObjectId, SnapshotHeader)],
+    remove: &HashSet<ObjectId>,
+    dry_run: bool,
+) -> Result<PruneReport> {
+    let (removed, kept): (Vec<_>, Vec<_>) = snaps.iter().partition(|(id, _)| remove.contains(id));
 
     // Mark. If any kept manifest can't be read we bail out *before* deleting
     // anything — otherwise we'd delete objects that snapshot still needs.
