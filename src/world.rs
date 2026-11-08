@@ -200,7 +200,11 @@ fn world_at(source: &Path, sel: &str) -> Result<FoundWorld> {
 
 /// The dimension a world-relative region path (`<dim>/region/r.x.z.mca`, or
 /// `entities/`, `poi/`) belongs to: `overworld`, `the_nether`, `the_end`, or
-/// `<namespace>:<name>` for `dimensions/<namespace>/<name>/`.
+/// `<namespace>:<name>` for other `dimensions/<namespace>/<name>/`.
+///
+/// Both layouts give the same names: the classic one (overworld at the world root,
+/// `DIM-1`, `DIM1`) and the newer one where every dimension lives under
+/// `dimensions/minecraft/<name>/`.
 pub fn dimension(path: &str) -> String {
     let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
     let dim = dir.rsplit_once('/').map_or("", |(d, _)| d);
@@ -209,6 +213,7 @@ pub fn dimension(path: &str) -> String {
         "DIM-1" => "the_nether".into(),
         "DIM1" => "the_end".into(),
         d => match d.strip_prefix("dimensions/").and_then(|r| r.split_once('/')) {
+            Some(("minecraft", name @ ("overworld" | "the_nether" | "the_end"))) => name.into(),
             Some((ns, name)) => format!("{ns}:{name}"),
             None => d.into(),
         },
@@ -376,6 +381,10 @@ mod tests {
         assert_eq!(dimension("DIM-1/region/r.0.0.mca"), "the_nether");
         assert_eq!(dimension("DIM1/poi/r.0.0.mca"), "the_end");
         assert_eq!(dimension("dimensions/twilight/forest/region/r.0.0.mca"), "twilight:forest");
+        // The newer layout, where every dimension lives under dimensions/minecraft/.
+        assert_eq!(dimension("dimensions/minecraft/overworld/region/r.0.0.mca"), "overworld");
+        assert_eq!(dimension("dimensions/minecraft/the_nether/entities/r.0.0.mca"), "the_nether");
+        assert_eq!(dimension("dimensions/minecraft/the_end/poi/r.0.0.mca"), "the_end");
         assert_eq!(normalize_dimension("minecraft:the_nether"), "the_nether");
         assert_eq!(normalize_dimension("end"), "the_end");
         assert_eq!(normalize_dimension("twilight:forest"), "twilight:forest");

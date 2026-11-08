@@ -1121,3 +1121,33 @@ fn cli_partial_restore() {
         "{out}"
     );
 }
+
+#[test]
+fn partial_restore_with_the_newer_dimensions_layout() {
+    // Newer versions keep every dimension under dimensions/minecraft/<name>/.
+    let env = setup();
+    let w = &env.world;
+    synth::write_world(w, 130, &[], 0, Compression::Zlib, |_, _| 0).unwrap();
+    let over = "dimensions/minecraft/overworld/region/r.0.0.mca";
+    let nether = "dimensions/minecraft/the_nether/region/r.0.0.mca";
+    write_region(&w.join(over), (0, 0), &entities(10, &[0, 1, 40]));
+    write_region(&w.join(nether), (0, 0), &entities(11, &[0]));
+    let id = do_backup(&env, "x").id;
+    let (over_then, nether_then) = (chunks_of(w, over), chunks_of(w, nether));
+
+    write_region(&w.join(over), (0, 0), &entities(12, &[0, 1, 40]));
+    write_region(&w.join(nether), (0, 0), &entities(13, &[0]));
+    let nether_now = chunks_of(w, nether);
+    // `overworld` means dimensions/minecraft/overworld here; chunks x 0..=1, z 0.
+    let sel = partial::Selection {
+        dimension: Some(vxl::world::normalize_dimension("overworld")),
+        area: Some(partial::Area::parse("0,0..31,15").unwrap()),
+    };
+    let r = partial::restore_partial(&repo(&env), &id, w, None, &sel, true, &hidden()).unwrap();
+    assert_eq!(r.chunks_restored, 2);
+    let o = chunks_of(w, over);
+    assert_eq!((&o[&0], &o[&1]), (&over_then[&0], &over_then[&1]));
+    assert_ne!(o[&40], over_then[&40], "outside the area");
+    assert_eq!(chunks_of(w, nether), nether_now, "other dimension untouched");
+    assert_ne!(nether_now, nether_then);
+}

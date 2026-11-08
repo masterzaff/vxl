@@ -199,8 +199,8 @@ vxl restore latest ~/server --force --dimension overworld --area -200,-200..200,
 `--area` takes block coordinates (corners in any order) and restores every chunk the
 rectangle touches. `--dimension` alone restores a whole dimension (`overworld`, `nether`,
 `end`, or a modded `namespace:name`). In a server snapshot the selection applies to every
-world, so `--dimension nether` finds `world_nether/DIM-1` on Paper and `world/DIM-1` on
-vanilla alike.
+world, so `--dimension nether` finds the Nether wherever this server keeps it: older Paper's
+`world_nether/DIM-1`, vanilla's `world/DIM-1`, or the newer `world/dimensions/minecraft/the_nether`.
 
 - Blocks, entities (mobs, item frames, armor stands) and points of interest (beds,
   workstations, portals) are restored together; they live in `region/`, `entities/` and
@@ -292,9 +292,10 @@ snapshot 8c41d0 | 131,052 chunks | 2,311 new | +41.7 MB stored (1.9s)
 
 A world is a folder with a `level.dat`, found up to two levels down (`world/`, or
 `worlds/lobby/` with Paper's `--world-container`). Everything inside a world belongs to it,
-so vanilla/Fabric/Forge dimensions (`world/DIM-1`, `world/dimensions/<mod>/…`) come along
-with `world`, while Paper's separate `world_nether` / `world_the_end` and Multiverse worlds
-are worlds of their own. `plugins/`, `mods/`, `config/`, `backups/`, `logs/` and similar
+so dimensions inside it come along with `world`: vanilla/Fabric/Forge's `world/DIM-1` and
+`world/dimensions/<mod>/…`, and newer versions' `world/dimensions/minecraft/<name>/` (where all
+three vanilla dimensions live). Older Paper's separate `world_nether` / `world_the_end` and
+Multiverse worlds are worlds of their own. `plugins/`, `mods/`, `config/`, `backups/`, `logs/` and similar
 folders are never searched, so a backup plugin's world copies aren't picked up. Symlinked
 worlds are followed.
 
@@ -324,8 +325,8 @@ vxl restore 8c41d0 ~/nether-copy -w world_nether
 ```
 
 Player data (inventories, positions, stats, advancements) lives only in the main world
-(`world/playerdata/` etc.), so restoring just `world_nether` rolls back the Nether's blocks
-but not anyone's inventory.
+(`world/playerdata/` etc., or `world/players/` in newer versions), so restoring just the
+Nether rolls back its blocks but not anyone's inventory.
 
 Backing up a single world folder (`vxl backup ~/server/world`) still works and restores as
 that world folder, like before.
