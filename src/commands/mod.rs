@@ -5,6 +5,7 @@ pub mod backup;
 pub mod compare;
 pub mod diff;
 pub mod list;
+pub mod partial;
 pub mod prune;
 pub mod restore;
 pub mod verify;

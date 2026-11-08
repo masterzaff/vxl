@@ -6,7 +6,7 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 
 use crate::anvil::{self, Compression, RawChunk};
-use crate::manifest::{FileEntry, Snapshot, World, safe_rel_path};
+use crate::manifest::{ChunkEntry, FileEntry, Snapshot, World, safe_rel_path};
 use crate::repo::{ObjectId, Repo};
 
 /// What to do when the target folder already has something in it.
@@ -139,7 +139,7 @@ pub fn restore(
     Ok(report)
 }
 
-fn check_overwrite_allowed(repo: &Repo, target: &Path, mode: Mode) -> Result<()> {
+pub(crate) fn check_overwrite_allowed(repo: &Repo, target: &Path, mode: Mode) -> Result<()> {
     if mode == Mode::Fresh {
         bail!(
             "{} is not empty. Restore into a new folder, or use --force (overwrite files) \
@@ -225,26 +225,7 @@ fn restore_file(repo: &Repo, f: &FileEntry, target: &Path) -> Result<u64> {
             Ok(0)
         }
         FileEntry::Region { chunks, .. } => {
-            let raw: Vec<RawChunk> = chunks
-                .par_iter()
-                .map(|c| {
-                    let data = repo.get(&c.hash)?;
-                    let payload = if c.verbatim {
-                        data
-                    } else {
-                        let comp = Compression::from_byte(c.comp)
-                            .ok_or_else(|| anyhow!("unknown compression {} in manifest", c.comp))?;
-                        anvil::compress(comp, &data)?
-                    };
-                    Ok(RawChunk {
-                        slot: c.slot,
-                        timestamp: c.ts,
-                        compression: c.comp,
-                        external: false,
-                        payload,
-                    })
-                })
-                .collect::<Result<_>>()?;
+            let raw: Vec<RawChunk> = chunks.par_iter().map(|c| raw_chunk(repo, c)).collect::<Result<_>>()?;
             let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             let built = anvil::build_region(&raw, anvil::region_coords(name))?;
             fs::write(&dest, built.region)?;
@@ -254,4 +235,17 @@ fn restore_file(repo: &Repo, f: &FileEntry, target: &Path) -> Result<u64> {
             Ok(chunks.len() as u64)
         }
     }
+}
+
+/// A manifest chunk back as Minecraft stores it: recompressed the way it was.
+pub fn raw_chunk(repo: &Repo, c: &ChunkEntry) -> Result<RawChunk> {
+    let data = repo.get(&c.hash)?;
+    let payload = if c.verbatim {
+        data
+    } else {
+        let comp = Compression::from_byte(c.comp)
+            .ok_or_else(|| anyhow!("unknown compression {} in manifest", c.comp))?;
+        anvil::compress(comp, &data)?
+    };
+    Ok(RawChunk { slot: c.slot, timestamp: c.ts, compression: c.comp, external: false, payload })
 }

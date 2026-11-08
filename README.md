@@ -44,7 +44,7 @@ cargo install --path .
 | `list` | snapshots, newest first, with what each one added and which worlds it holds |
 | `show <snapshot>` | one snapshot in detail: its worlds, files, chunks and sizes |
 | `diff <a> [b] [--files]` | what changed from snapshot `a` to `b` (default: latest), per world and dimension, without restoring; chunks compare by content |
-| `restore <id> <folder> [-w world] [--force \| --force-wipe]` | rebuild a snapshot (or one world of it) into a new or empty folder, or over an existing world (see below) |
+| `restore <id> <folder> [-w world] [--force \| --force-wipe] [--dimension d] [--area x1,z1..x2,z2]` | rebuild a snapshot (or one world, dimension or area of it) into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
 | `compare <a> <b>` | compare two world folders chunk by chunk (e.g. original vs restored) and check `b`'s region files are laid out so Minecraft can read them |
 | `prune [--keep-last/hourly/daily/weekly/monthly/yearly N]… [--dry-run]` | drop snapshots no rule keeps, delete/compact packs holding data nothing references (see below) |
@@ -161,6 +161,32 @@ Both rebuild the full snapshot in a `.vxl-staging-*` folder inside the target fi
 move files into place once that has worked, so a failed restore (e.g. a damaged object)
 leaves the world unchanged. They refuse to touch a folder without `level.dat`, so a typo
 can't wipe your home directory.
+
+## Rolling back part of a world
+
+Griefed spawn, but everyone else's progress should stay? Restore just that area (with the
+server stopped):
+
+```bash
+vxl restore latest ~/server --force --dimension overworld --area -200,-200..200,200
+```
+
+`--area` takes block coordinates (corners in any order) and restores every chunk the
+rectangle touches. `--dimension` alone restores a whole dimension (`overworld`, `nether`,
+`end`, or a modded `namespace:name`). In a server snapshot the selection applies to every
+world, so `--dimension nether` finds `world_nether/DIM-1` on Paper and `world/DIM-1` on
+vanilla alike.
+
+- Blocks, entities (mobs, item frames, armor stands) and points of interest (beds,
+  workstations, portals) are restored together; they live in `region/`, `entities/` and
+  `poi/` at the same coordinates, and restoring only blocks leaves mobs and villagers wrong.
+- Inside the selection the world becomes exactly the snapshot: chunks generated after it
+  are removed and the game generates them again. Outside it, nothing changes.
+- `level.dat` and player data are never touched, so inventories and positions stay as they
+  are now.
+- All affected region files are rebuilt in a staging folder first; if anything fails, the
+  world is unchanged. Without `--force` it only writes into a new or empty folder, which
+  gives you just those region files.
 
 ## Backing up a running server
 

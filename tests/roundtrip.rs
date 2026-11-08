@@ -8,7 +8,7 @@ use std::process::Command;
 use indicatif::ProgressBar;
 use tempfile::TempDir;
 use vxl::anvil::{self, Compression, RawChunk};
-use vxl::commands::{backup, list, prune, restore, verify};
+use vxl::commands::{backup, list, partial, prune, restore, verify};
 use vxl::repo::{LockMode, ObjectId, Repo};
 use vxl::retention::Policy;
 use vxl::synth;
@@ -975,4 +975,149 @@ fn cli_diff() {
     let out = vxl(&["diff", &first, "latest", "--files"]);
     assert!(out.contains("    M region/r.0.0.mca (3 changed)"), "{out}");
     assert!(out.contains("    A DIM1/region/r.0.0.mca (1 added)"), "{out}");
+}
+
+/// Chunks of one region file in a world: slot → decompressed NBT.
+fn chunks_of(dir: &Path, rel: &str) -> BTreeMap<u16, Vec<u8>> {
+    match contents(dir).remove(rel) {
+        Some(Content::Region(cs)) => cs.into_iter().map(|(slot, _, _, nbt)| (slot, nbt)).collect(),
+        None => BTreeMap::new(),
+        Some(other) => panic!("{rel} is not a region: {other:?}"),
+    }
+}
+
+fn entities(seed: u64, slots: &[u16]) -> Vec<RawChunk> {
+    slots
+        .iter()
+        .map(|&slot| RawChunk {
+            slot,
+            timestamp: 1,
+            compression: 2,
+            external: false,
+            payload: anvil::compress(Compression::Zlib, &synth::chunk_nbt(seed, slot as i32, 0, 0)).unwrap(),
+        })
+        .collect()
+}
+
+#[test]
+fn partial_restore_puts_back_one_area_with_its_entities() {
+    let env = setup();
+    let w = &env.world;
+    // 120 chunks per region = slots x 0..31, z 0..3.
+    synth::write_world(w, 100, REGIONS, 120, Compression::Zlib, |_, _| 0).unwrap();
+    write_region(&w.join("entities/r.0.0.mca"), (0, 0), &entities(1, &[0, 40]));
+    write_region(&w.join("DIM-1/region/r.0.0.mca"), (0, 0), &entities(2, &[0]));
+    let id = do_backup(&env, "before").id;
+    let snap_region = chunks_of(w, "region/r.0.0.mca");
+    let snap_entities = chunks_of(w, "entities/r.0.0.mca");
+
+    // Grief: every chunk changes, more chunks get generated (z up to 6), mobs move,
+    // the nether changes, players keep playing.
+    synth::write_world(w, 100, REGIONS, 220, Compression::Zlib, |_, _| 9).unwrap();
+    write_region(&w.join("entities/r.0.0.mca"), (0, 0), &entities(3, &[0, 40]));
+    write_region(&w.join("DIM-1/region/r.0.0.mca"), (0, 0), &entities(4, &[0]));
+    let griefed = contents(w);
+    let griefed_region = chunks_of(w, "region/r.0.0.mca");
+
+    let sel = |dim: Option<&str>, area: Option<&str>| partial::Selection {
+        dimension: dim.map(String::from),
+        area: area.map(|a| partial::Area::parse(a).unwrap()),
+    };
+    // Chunks x 0..=2, z 0..=6: 12 of them were in the snapshot, 9 are newer.
+    let area = sel(Some("overworld"), Some("0,0..47,111"));
+    let restore_area = |s: &partial::Selection, force: bool| {
+        partial::restore_partial(&repo(&env), &id, w, None, s, force, &hidden())
+    };
+
+    // Safety: an existing world needs --force; --area needs a dimension here.
+    assert!(restore_area(&area, false).unwrap_err().to_string().contains("--force"));
+    let err = restore_area(&sel(None, Some("0,0..47,111")), true).unwrap_err().to_string();
+    assert!(err.contains("--dimension") && err.contains("the_nether"), "{err}");
+    assert!(
+        restore_area(&sel(Some("the_end"), None), true).unwrap_err().to_string().contains("no dimension")
+    );
+    assert_eq!(contents(w), griefed);
+
+    let r = restore_area(&area, true).unwrap();
+    assert_eq!((r.chunks_restored, r.chunks_removed), (12 + 1, 9), "{r:?}"); // + the entity chunk
+    assert_no_staging(w);
+
+    let now = chunks_of(w, "region/r.0.0.mca");
+    let in_area = |slot: u16| slot % 32 <= 2 && slot / 32 <= 6;
+    for (slot, nbt) in &griefed_region {
+        match (in_area(*slot), snap_region.get(slot)) {
+            (true, Some(old)) => assert_eq!(&now[slot], old, "slot {slot} restored"),
+            (true, None) => assert!(!now.contains_key(slot), "slot {slot} didn't exist then: removed"),
+            (false, _) => assert_eq!(&now[slot], nbt, "slot {slot} outside the area: untouched"),
+        }
+    }
+    // Entities: the one inside the area is back, the one at x=8 stays as it is now.
+    let ents = chunks_of(w, "entities/r.0.0.mca");
+    assert_eq!(ents[&0], snap_entities[&0]);
+    assert_ne!(ents[&40], snap_entities[&40]);
+    // Everything else is untouched: the other region, the nether, player data, level.dat.
+    let mut after = contents(w);
+    let mut before = griefed;
+    for f in ["region/r.0.0.mca", "entities/r.0.0.mca"] {
+        after.remove(f);
+        before.remove(f);
+    }
+    assert_eq!(after, before);
+}
+
+#[test]
+fn partial_restore_of_a_dimension_and_into_a_new_folder() {
+    let env = setup();
+    let s = env.base.join("server");
+    synth::write_world(&s.join("world"), 110, &[(0, 0)], 10, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&s.join("world_nether"), 111, &[], 0, Compression::Zlib, |_, _| 0).unwrap();
+    write_region(&s.join("world_nether/DIM-1/region/r.0.0.mca"), (0, 0), &entities(5, &[0, 1]));
+    let id = backup::backup(&repo(&env), &s, &backup::Options::default(), &hidden()).unwrap().id;
+    let nether_then = contents(&s.join("world_nether"));
+
+    // The nether gets wrecked, including a region the snapshot never had.
+    write_region(&s.join("world_nether/DIM-1/region/r.0.0.mca"), (0, 0), &entities(6, &[0, 1, 2]));
+    write_region(&s.join("world_nether/DIM-1/region/r.5.5.mca"), (5, 5), &entities(7, &[0]));
+    synth::write_world(&s.join("world"), 110, &[(0, 0)], 10, Compression::Zlib, |_, _| 3).unwrap();
+    let overworld_now = contents(&s.join("world"));
+
+    // Paper layout: `--dimension nether` over the whole server finds it in world_nether.
+    let sel = partial::Selection { dimension: Some("the_nether".into()), area: None };
+    let r = partial::restore_partial(&repo(&env), &id, &s, None, &sel, true, &hidden()).unwrap();
+    assert_eq!(r.files_deleted, 1, "r.5.5 didn't exist then");
+    let mut nether_now = contents(&s.join("world_nether"));
+    nether_now.remove("session.lock");
+    let mut want = nether_then;
+    want.remove("session.lock");
+    assert_eq!(nether_now, want);
+    assert_eq!(contents(&s.join("world")), overworld_now, "the overworld is untouched");
+
+    // Into a new folder: just the selected region files, e.g. to hand someone an area.
+    let out = env.base.join("export");
+    let r = partial::restore_partial(&repo(&env), &id, &out, Some("world_nether"), &sel, false, &hidden())
+        .unwrap();
+    assert_eq!(r.files_written, 1);
+    assert!(out.join("DIM-1/region/r.0.0.mca").exists() && !out.join("level.dat").exists());
+}
+
+#[test]
+fn cli_partial_restore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let world = tmp.path().join("world");
+    let repo = tmp.path().join("repo");
+    synth::write_world(&world, 120, &[(0, 0)], 64, Compression::Zlib, |_, _| 0).unwrap();
+    let vxl = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_vxl")).args(args).env("VXL_REPO", &repo).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    vxl(&["init", repo.to_str().unwrap()]);
+    vxl(&["backup", world.to_str().unwrap()]);
+    synth::write_world(&world, 120, &[(0, 0)], 64, Compression::Zlib, |_, _| 2).unwrap();
+    let out = vxl(&["restore", "latest", world.to_str().unwrap(), "--force", "--area", "-16,-16..31,15"]);
+    // Chunks x -1..=1, z -1..=0; the region holds x 0..31, z 0..1, so x 0..=1, z 0 exist.
+    assert!(
+        out.contains("restored 6 chunks from") && out.contains("| 2 chunks put back, 0 removed |"),
+        "{out}"
+    );
 }

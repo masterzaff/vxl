@@ -198,6 +198,36 @@ fn world_at(source: &Path, sel: &str) -> Result<FoundWorld> {
     Ok(FoundWorld { name, rel, abs: dir.canonicalize()? })
 }
 
+/// The dimension a world-relative region path (`<dim>/region/r.x.z.mca`, or
+/// `entities/`, `poi/`) belongs to: `overworld`, `the_nether`, `the_end`, or
+/// `<namespace>:<name>` for `dimensions/<namespace>/<name>/`.
+pub fn dimension(path: &str) -> String {
+    let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+    let dim = dir.rsplit_once('/').map_or("", |(d, _)| d);
+    match dim {
+        "" => "overworld".into(),
+        "DIM-1" => "the_nether".into(),
+        "DIM1" => "the_end".into(),
+        d => match d.strip_prefix("dimensions/").and_then(|r| r.split_once('/')) {
+            Some((ns, name)) => format!("{ns}:{name}"),
+            None => d.into(),
+        },
+    }
+}
+
+/// What a user may type for a dimension: `nether`, `minecraft:the_nether`, `DIM-1`… →
+/// the name [`dimension`] uses.
+pub fn normalize_dimension(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix("minecraft:").unwrap_or(s);
+    match s {
+        "nether" | "DIM-1" => "the_nether".into(),
+        "end" | "DIM1" => "the_end".into(),
+        "world" => "overworld".into(),
+        other => other.into(),
+    }
+}
+
 pub struct Scan {
     pub files: Vec<WorldFile>,
     pub warnings: Vec<String>,
@@ -337,6 +367,18 @@ mod tests {
                 .to_string()
                 .contains("no worlds")
         );
+    }
+
+    #[test]
+    fn dimensions() {
+        assert_eq!(dimension("region/r.0.0.mca"), "overworld");
+        assert_eq!(dimension("entities/r.0.0.mca"), "overworld");
+        assert_eq!(dimension("DIM-1/region/r.0.0.mca"), "the_nether");
+        assert_eq!(dimension("DIM1/poi/r.0.0.mca"), "the_end");
+        assert_eq!(dimension("dimensions/twilight/forest/region/r.0.0.mca"), "twilight:forest");
+        assert_eq!(normalize_dimension("minecraft:the_nether"), "the_nether");
+        assert_eq!(normalize_dimension("end"), "the_end");
+        assert_eq!(normalize_dimension("twilight:forest"), "twilight:forest");
     }
 
     #[test]

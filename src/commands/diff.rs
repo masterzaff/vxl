@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::manifest::{ChunkEntry, FileEntry, Snapshot, World};
 use crate::repo::ObjectId;
+pub use crate::world::dimension;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counts {
@@ -154,22 +155,6 @@ fn chunk_counts(a: Option<&FileEntry>, b: Option<&FileEntry>) -> Option<Counts> 
     Some(c)
 }
 
-/// The dimension a world-relative region path belongs to.
-pub fn dimension(path: &str) -> String {
-    // `<dim>/region/r.x.z.mca` (or entities/, poi/); `<dim>` is empty for the overworld.
-    let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
-    let dim = dir.rsplit_once('/').map_or("", |(d, _)| d);
-    match dim {
-        "" => "overworld".into(),
-        "DIM-1" => "the_nether".into(),
-        "DIM1" => "the_end".into(),
-        d => match d.strip_prefix("dimensions/").and_then(|r| r.split_once('/')) {
-            Some((ns, name)) => format!("{ns}:{name}"),
-            None => d.into(),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,15 +200,6 @@ mod tests {
                 .collect(),
             files: vec![],
         }
-    }
-
-    #[test]
-    fn dimensions() {
-        assert_eq!(dimension("region/r.0.0.mca"), "overworld");
-        assert_eq!(dimension("entities/r.0.0.mca"), "overworld");
-        assert_eq!(dimension("DIM-1/region/r.0.0.mca"), "the_nether");
-        assert_eq!(dimension("DIM1/poi/r.0.0.mca"), "the_end");
-        assert_eq!(dimension("dimensions/twilight/forest/region/r.0.0.mca"), "twilight:forest");
     }
 
     #[test]

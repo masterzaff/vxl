@@ -109,10 +109,12 @@ snapshot, and a restore of it loads cleanly:
 
 *Goal: roll back a griefed spawn without rolling back everyone's progress.*
 
-1. **Partial restore.** `--dimension`, `--region`, or `--area x1,z1..x2,z2` (block
-   coordinates) into a stopped live world. Must bring the matching `entities/` and `poi/`
+1. ✅ **Partial restore.** `--dimension` and/or `--area x1,z1..x2,z2` (block coordinates)
+   into a stopped live world with `--force`. Brings the matching `entities/` and `poi/`
    chunks along: since 1.17 entities live in separate files, and restoring blocks without
-   them leaves mobs and item frames wrong.
+   them leaves mobs and item frames wrong. Inside the selection the world becomes exactly
+   the snapshot (newer chunks are removed and regenerate); `--area` needs `--dimension` when
+   a world has several. (`--region` was dropped: an area of 512×512 blocks says the same.)
 2. ✅ **`vxl diff <a> [b]`** between snapshots, without restoring: per world and dimension,
    chunks changed/added/removed by content, other files changed; `--files` lists every file.
    (`vxl compare` does this for two folders.)

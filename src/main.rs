@@ -7,7 +7,7 @@ use chrono::Local;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use vxl::commands::{backup, compare, diff, list, prune, restore, verify};
+use vxl::commands::{backup, compare, diff, list, partial, prune, restore, verify};
 use vxl::config::Config;
 use vxl::hooks::{self, Hooks};
 use vxl::repo::{self, LockMode, Repo};
@@ -171,6 +171,15 @@ enum Cmd {
         /// like the snapshot. This is what you want to roll a world back.
         #[arg(long)]
         force_wipe: bool,
+        /// Restore only this dimension (`overworld`, `nether`, `end`, or `mod:name`) into the
+        /// existing world(s) with --force, leaving the rest alone.
+        #[arg(long, conflicts_with = "force_wipe")]
+        dimension: Option<String>,
+        /// Restore only the chunks touching this rectangle, in block coordinates
+        /// (`x1,z1..x2,z2`), with their entities and POIs. Needs --dimension if the world has
+        /// several. Inside it the world becomes exactly the snapshot; everything else stays.
+        #[arg(long, value_name = "X1,Z1..X2,Z2", conflicts_with = "force_wipe", allow_hyphen_values = true)]
+        area: Option<String>,
         #[command(flatten)]
         repo: RepoArg,
     },
@@ -505,9 +514,41 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
 
-        Cmd::Restore { snapshot, target, world, force, force_wipe, repo } => {
+        Cmd::Restore { snapshot, target, world, force, force_wipe, dimension, area, repo } => {
             let repo = open(&repo, &cfg, LockMode::Shared)?;
             let id = list::resolve(&repo, &snapshot)?;
+            if dimension.is_some() || area.is_some() {
+                let sel = partial::Selection {
+                    dimension: dimension.as_deref().map(vxl::world::normalize_dimension),
+                    area: area.as_deref().map(partial::Area::parse).transpose()?,
+                };
+                let source = PathBuf::from(repo.load_header(&id)?.source);
+                if force && target.canonicalize().is_ok_and(|t| t.starts_with(&source)) {
+                    eprintln!(
+                        "warning: restoring into the world this snapshot came from; make sure the server is stopped"
+                    );
+                }
+                let pb = bar("restoring", false);
+                let r = partial::restore_partial(&repo, &id, &target, world.as_deref(), &sel, force, &pb)?;
+                pb.finish_and_clear();
+                print_warnings(&r.warnings);
+                let what = match (&sel.dimension, &sel.area) {
+                    (Some(d), Some(a)) => format!("{} chunks of {d}", thousands(a.chunks())),
+                    (None, Some(a)) => format!("{} chunks", thousands(a.chunks())),
+                    (Some(d), None) => d.clone(),
+                    (None, None) => unreachable!(),
+                };
+                println!(
+                    "restored {what} from {} into {} | {} chunks put back, {} removed | {} region files written, {} deleted",
+                    short(&id, 6),
+                    target.display(),
+                    thousands(r.chunks_restored),
+                    thousands(r.chunks_removed),
+                    thousands(r.files_written),
+                    thousands(r.files_deleted),
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
             let mode = match (force, force_wipe) {
                 (_, true) => restore::Mode::Wipe,
                 (true, _) => restore::Mode::Replace,
