@@ -150,11 +150,13 @@ Steps:
 
 ## Phase 4: robustness and operations
 
-- **Offsite copies.** Packs never change once written, so `rsync`/`rclone` of a repo is
-  cheap and incremental. Document first; built-in S3 target and encryption only if needed.
+- ✅ **Offsite copies, documented.** Packs never change once written, so `rsync`/`rclone` of a
+  repo is cheap and incremental; README shows a two-step copy (packs first) under a shared
+  `flock`. Built-in S3 target and encryption only if needed.
 - **Fuzzing** the parsers that read untrusted bytes (anvil, NBT, pack) with `cargo-fuzz`.
-- **Big-repo speed.** Cache pack indexes and snapshot headers so `open`/`list` stay fast
-  after hundreds of snapshots.
+- **Big-repo speed.** ✅ Snapshot headers are cached (`cache/headers/`), so `list` and
+  `prune` don't decompress whole manifests. Still open: a combined pack-index cache, so
+  `open` reads one file instead of every pack's index once there are thousands of packs.
 - **Close the untested paths:** an LZ4 world, real use on Windows.
 - **Releases.** Prebuilt binaries via GitHub Releases, so servers don't need Rust.
 

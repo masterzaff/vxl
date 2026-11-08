@@ -6,6 +6,7 @@
 //!   lock                    OS file lock (backup/prune exclusive, restore/verify shared)
 //!   packs/<id>.pack         many zstd-compressed objects + an index (see `pack.rs`)
 //!   snapshots/<id>.json.zst manifests
+//!   cache/headers/<id>.json snapshot headers, so `list` needn't read whole manifests
 //!   tmp/                    staging area for atomic writes
 //! ```
 //!
@@ -463,17 +464,41 @@ impl Repo {
         Ok(snap)
     }
 
+    /// A snapshot's header. Served from `cache/headers/` when possible: a manifest of a
+    /// big world is tens of MB, and `list`/`prune` need only its header. Snapshots never
+    /// change (the id is the hash of the content), so a cached header can't go stale; a
+    /// missing or unreadable cache entry just means reading the manifest.
     pub fn load_header(&self, id: &ObjectId) -> Result<SnapshotHeader> {
+        let cached = self.header_cache_path(id);
+        if let Some(mut h) =
+            fs::read(&cached).ok().and_then(|b| serde_json::from_slice::<SnapshotHeader>(&b).ok())
+            && self.snapshot_path(id).exists()
+        {
+            check_version(id, h.version)?;
+            h.upgrade();
+            return Ok(h);
+        }
         let json = self.read_snapshot_json(id)?;
         let mut h: SnapshotHeader =
             serde_json::from_slice(&json).with_context(|| format!("parsing snapshot {id}"))?;
         check_version(id, h.version)?;
         h.upgrade();
+        // Best effort: a read-only repo or a concurrent prune just means no cache.
+        if let Ok(bytes) = serde_json::to_vec(&h) {
+            let _ = fs::create_dir_all(cached.parent().unwrap())
+                .map_err(anyhow::Error::from)
+                .and_then(|()| atomic_write(&cached, &self.tmp_dir(), &bytes));
+        }
         Ok(h)
+    }
+
+    fn header_cache_path(&self, id: &ObjectId) -> PathBuf {
+        self.root.join("cache").join("headers").join(format!("{}.json", id.hex()))
     }
 
     pub fn delete_snapshot(&self, id: &ObjectId) -> Result<()> {
         fs::remove_file(self.snapshot_path(id))?;
+        let _ = fs::remove_file(self.header_cache_path(id));
         Ok(())
     }
 
@@ -666,5 +691,36 @@ mod tests {
         let b = ObjectId::from_hex(&format!("abcdef1{}", "0".repeat(57))).unwrap();
         assert_eq!(short_len(&[a]), 6);
         assert_eq!(short_len(&[a, b]), 7);
+    }
+
+    #[test]
+    fn headers_are_cached_and_survive_a_bad_cache() {
+        use crate::manifest::{FORMAT_VERSION, Stats};
+        let (dir, repo) = fresh(DEFAULT_PACK_SIZE);
+        let snap = Snapshot {
+            header: SnapshotHeader {
+                version: FORMAT_VERSION,
+                created: chrono::Utc::now(),
+                message: Some("hi".into()),
+                source: "/srv/mc".into(),
+                stats: Stats::default(),
+                world_names: vec!["world".into()],
+            },
+            worlds: vec![],
+            files: vec![],
+        };
+        let id = repo.write_snapshot(&snap).unwrap();
+        let cache = dir.path().join("cache/headers").join(format!("{}.json", id.hex()));
+        assert!(!cache.exists());
+        assert_eq!(repo.load_header(&id).unwrap().message.as_deref(), Some("hi"));
+        assert!(cache.exists(), "first read fills the cache");
+        assert_eq!(repo.load_header(&id).unwrap().message.as_deref(), Some("hi"));
+
+        fs::write(&cache, b"{not json").unwrap();
+        assert_eq!(repo.load_header(&id).unwrap().message.as_deref(), Some("hi"), "bad cache: read the manifest");
+
+        repo.delete_snapshot(&id).unwrap();
+        assert!(!cache.exists());
+        assert!(repo.load_header(&id).is_err());
     }
 }

@@ -162,6 +162,27 @@ move files into place once that has worked, so a failed restore (e.g. a damaged 
 leaves the world unchanged. They refuse to touch a folder without `level.dat`, so a typo
 can't wipe your home directory.
 
+## Offsite copies
+
+A backup on the server's own disk dies with that disk. A vxl repo is easy to copy: packs are
+written once and never changed (prune only deletes or replaces whole packs), so `rsync` or
+`rclone` transfer just the new ones. Copy in two steps, packs first, so the copy never has a
+snapshot whose data hasn't arrived:
+
+```bash
+# hold a shared lock so no backup or prune changes the repo meanwhile (Linux: util-linux flock)
+flock --shared /backups/mc-repo/lock sh -c '
+  rsync -a --exclude tmp/ /backups/mc-repo/packs/ offsite:mc-repo/packs/ &&
+  rsync -a --delete --exclude tmp/ /backups/mc-repo/ offsite:mc-repo/
+'
+```
+
+With rclone: `rclone copy repo/packs remote:mc-repo/packs`, then
+`rclone sync repo remote:mc-repo --exclude "tmp/**"`. Run it after the nightly backup and
+prune (a backup started during the copy finds the repo busy and fails rather than waiting).
+`vxl verify --repo <copy>` on the other side checks every object of the copy. A copy is a
+complete repo: point `--repo` at it to list or restore from it directly.
+
 ## Rolling back part of a world
 
 Griefed spawn, but everyone else's progress should stay? Restore just that area (with the
@@ -317,6 +338,7 @@ repo/
   lock                      OS file lock: backup/prune are exclusive, restore/verify shared
   packs/<id>.pack           ~16 MiB files of zstd-compressed objects, each with its own index
   snapshots/<id>.json.zst   one manifest per snapshot
+  cache/headers/<id>.json   snapshot headers, so `list` and `prune` don't read whole manifests
   tmp/                      staging for atomic writes
 ```
 
