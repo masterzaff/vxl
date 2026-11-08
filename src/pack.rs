@@ -130,8 +130,9 @@ pub fn read_index(path: &Path) -> Result<(u64, Vec<Entry>)> {
     }
     let mut raw = vec![0u8; (count as usize) * ENTRY_LEN];
     read_at(&f, &mut raw, index_offset)?;
-    let entries = raw
-        .chunks_exact(ENTRY_LEN)
+    let (entries, _) = raw.as_chunks::<ENTRY_LEN>();
+    let entries = entries
+        .iter()
         .map(|e| {
             let entry = Entry {
                 id: ObjectId(e[..32].try_into().unwrap()),
