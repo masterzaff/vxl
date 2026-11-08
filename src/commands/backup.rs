@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -21,6 +21,18 @@ pub struct BackupReport {
     /// The worlds that were backed up, in snapshot order.
     pub worlds: Vec<FoundWorld>,
     pub warnings: Vec<String>,
+    /// Files that kept changing while being read; their stored copies may be torn.
+    pub torn: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Which worlds (see [`world::select_worlds`]); empty = all.
+    pub worlds: Vec<String>,
+    /// Note to attach to the snapshot.
+    pub message: Option<String>,
+    /// Refuse to save a snapshot if any file kept changing while being read.
+    pub strict: bool,
 }
 
 /// What backing up one file produced.
@@ -30,20 +42,16 @@ struct Done {
     warnings: Vec<String>,
     /// `.mcc` files read as part of this region (absolute paths).
     consumed: Vec<PathBuf>,
+    /// The file never read the same twice: the stored copy may be torn.
+    torn: bool,
 }
 
 /// Back up the worlds under `source` (or `source` itself, if it is a world) that
-/// `selectors` pick (see [`world::select_worlds`]; empty = all) as one snapshot.
-pub fn backup(
-    repo: &Repo,
-    source: &Path,
-    selectors: &[String],
-    message: Option<String>,
-    progress: &ProgressBar,
-) -> Result<BackupReport> {
+/// `opts.worlds` pick as one snapshot.
+pub fn backup(repo: &Repo, source: &Path, opts: &Options, progress: &ProgressBar) -> Result<BackupReport> {
     let source_abs = source.canonicalize().with_context(|| format!("opening {}", source.display()))?;
     let found = world::find_worlds(&source_abs)?;
-    let selected = world::select_worlds(&source_abs, &found, selectors)?;
+    let selected = world::select_worlds(&source_abs, &found, &opts.worlds)?;
     let repo_root = repo.root().canonicalize()?;
     for w in &selected {
         if repo_root.starts_with(&w.abs) {
@@ -56,9 +64,10 @@ pub fn backup(
 
     let mut stats = Stats::default();
     let mut warnings = Vec::new();
+    let mut torn = 0;
     let mut worlds = Vec::with_capacity(selected.len());
     for (w, scan) in selected.iter().zip(scans) {
-        let (files, s) = backup_world(repo, scan, progress, &mut warnings, &w.name)?;
+        let (files, s) = backup_world(repo, scan, progress, &mut warnings, &mut torn, &w.name)?;
         add(&mut stats, &s);
         worlds.push(World { name: w.name.clone(), path: w.rel.clone(), stats: s, files });
     }
@@ -66,12 +75,18 @@ pub fn backup(
     // Objects first, durably; then the manifest. A crash (or interrupt) before this
     // point leaves only unreferenced objects, which `prune` cleans up.
     check_interrupted()?;
+    if opts.strict && torn > 0 {
+        bail!(
+            "{torn} file(s) kept changing while being read, so this snapshot could be torn; \
+             not saving it (--strict). Pause saving with a --pre hook"
+        );
+    }
     repo.flush()?;
     let snap = Snapshot {
         header: SnapshotHeader {
             version: FORMAT_VERSION,
             created: Utc::now(),
-            message,
+            message: opts.message.clone(),
             source: source_abs.display().to_string(),
             stats: stats.clone(),
             world_names: worlds.iter().map(|w| w.name.clone()).collect(),
@@ -80,7 +95,7 @@ pub fn backup(
         files: vec![],
     };
     let id = repo.write_snapshot(&snap)?;
-    Ok(BackupReport { id, stats, worlds: selected, warnings })
+    Ok(BackupReport { id, stats, worlds: selected, warnings, torn })
 }
 
 fn add(total: &mut Stats, s: &Stats) {
@@ -98,6 +113,7 @@ fn backup_world(
     scan: Scan,
     progress: &ProgressBar,
     warnings: &mut Vec<String>,
+    torn: &mut u64,
     name: &str,
 ) -> Result<(Vec<FileEntry>, Stats)> {
     warnings.extend(scan.warnings.into_iter().map(|w| format!("{name}: {w}")));
@@ -135,6 +151,7 @@ fn backup_world(
     let mut entries = Vec::with_capacity(done.len());
     for d in done {
         add(&mut stats, &d.stats);
+        *torn += d.torn as u64;
         warnings.extend(d.warnings.into_iter().map(|w| format!("{name}/{}: {w}", d.entry.path())));
         entries.push(d.entry);
     }
@@ -142,27 +159,81 @@ fn backup_world(
     Ok((entries, stats))
 }
 
-/// Read a file and report whether it changed while we were reading it
-/// (a sign the server is still writing — torn data).
-fn read_checked(path: &Path, warnings: &mut Vec<String>) -> Result<Vec<u8>> {
+/// How hard to try for a consistent read of a file the server may be writing.
+pub const READ_ATTEMPTS: u32 = 5;
+/// Wait before the n-th retry: n × this.
+const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// One read of a file.
+pub struct Attempt<T> {
+    pub value: T,
+    /// Size and mtime were the same before and after the read.
+    pub unchanged: bool,
+    /// The content looks damaged (a chunk that won't decompress, a header pointing
+    /// past the end…): either really damaged, or caught mid-write.
+    pub suspect: bool,
+    /// Hash of the raw bytes read, to tell "stably damaged" from "still changing".
+    pub fingerprint: ObjectId,
+}
+
+/// Read until the result can be trusted: the file didn't change during the read and
+/// either looks fine or reads identically twice in a row (then it's damaged on disk,
+/// not torn, and is kept as it is). Returns the last read, how many reads it took, and
+/// whether it settled; one that never settled may be torn.
+pub fn settle<T>(
+    mut read: impl FnMut() -> Result<Attempt<T>>,
+    attempts: u32,
+    delay: Duration,
+) -> Result<(T, u32, bool)> {
+    let mut prev: Option<Attempt<T>> = None;
+    for n in 1..=attempts {
+        let a = read()?;
+        let same_as_before = prev.as_ref().is_some_and(|p| p.unchanged && p.fingerprint == a.fingerprint);
+        if a.unchanged && (!a.suspect || same_as_before) {
+            return Ok((a.value, n, true));
+        }
+        prev = Some(a);
+        if n < attempts {
+            check_interrupted()?;
+            std::thread::sleep(delay * n);
+        }
+    }
+    Ok((prev.expect("attempts ≥ 1").value, attempts, false))
+}
+
+/// Read a file, noting whether its size or mtime changed meanwhile.
+fn read_once(path: &Path) -> Result<(Vec<u8>, bool)> {
     let stamp = |p: &Path| -> Result<(Option<SystemTime>, u64)> {
         let m = fs::metadata(p)?;
         Ok((m.modified().ok(), m.len()))
     };
     let before = stamp(path)?;
     let data = fs::read(path)?;
-    if stamp(path)? != before || data.len() as u64 != before.1 {
-        warnings.push(
-            "changed while being read — is the server still saving? (pause saving with a --pre hook)".into(),
-        );
-    }
-    Ok(data)
+    let unchanged = stamp(path)? == before && data.len() as u64 == before.1;
+    Ok((data, unchanged))
+}
+
+fn torn_warning(attempts: u32) -> String {
+    format!(
+        "kept changing while being read ({attempts} tries); this copy may be torn. \
+         Is the server still saving? Pause saving with a --pre hook"
+    )
 }
 
 fn backup_blob(repo: &Repo, f: &WorldFile) -> Result<Done> {
-    let mut warnings = Vec::new();
-    let data = read_checked(&f.abs, &mut warnings)?;
-    blob_done(repo, f, &data, warnings)
+    let (data, tries, settled) = settle(
+        || {
+            let (data, unchanged) = read_once(&f.abs)?;
+            let fingerprint = ObjectId::of(&data);
+            Ok(Attempt { value: data, unchanged, suspect: false, fingerprint })
+        },
+        READ_ATTEMPTS,
+        RETRY_DELAY,
+    )?;
+    let warnings = if settled { vec![] } else { vec![torn_warning(tries)] };
+    let mut done = blob_done(repo, f, &data, warnings)?;
+    done.torn = !settled;
+    Ok(done)
 }
 
 fn blob_done(repo: &Repo, f: &WorldFile, data: &[u8], warnings: Vec<String>) -> Result<Done> {
@@ -175,35 +246,53 @@ fn blob_done(repo: &Repo, f: &WorldFile, data: &[u8], warnings: Vec<String>) -> 
         ..Default::default()
     };
     let entry = FileEntry::Blob { path: f.rel.clone(), size: data.len() as u64, hash: put.id };
-    Ok(Done { entry, stats, warnings, consumed: vec![] })
+    Ok(Done { entry, stats, warnings, consumed: vec![], torn: false })
 }
 
-fn backup_region(repo: &Repo, f: &WorldFile, coords: (i32, i32)) -> Result<Done> {
-    let mut warnings = Vec::new();
-    let data = read_checked(&f.abs, &mut warnings)?;
-    let dir = f.abs.parent().unwrap();
+/// One read of a region file, with its chunks already stored. If the read turns out
+/// not to be trustworthy and is retried, what it stored is merely unreferenced (and
+/// `prune` removes it); the stats are taken from the read that was kept.
+enum ReadRegion {
+    /// Not a valid region file: stored whole later.
+    Invalid { data: Vec<u8>, error: String },
+    Valid {
+        data_len: u64,
+        parsed_warnings: Vec<String>,
+        external_files: Vec<String>,
+        chunks: Vec<(ChunkEntry, Option<String>)>,
+    },
+}
 
+fn read_region(
+    repo: &Repo,
+    path: &Path,
+    coords: (i32, i32),
+    stored: &mut HashMap<ObjectId, u64>,
+) -> Result<Attempt<ReadRegion>> {
+    let (data, unchanged) = read_once(path)?;
+    let fingerprint = ObjectId::of(&data);
+    let dir = path.parent().unwrap();
     let parsed = match anvil::parse_region(&data, Some(coords), |name| fs::read(dir.join(name))) {
         Ok(p) => p,
         Err(e) => {
             // Empty region files are normal (Minecraft creates them eagerly).
-            if !data.is_empty() {
-                warnings.push(format!("not a valid region file ({e}); stored as a plain file"));
-            }
-            return blob_done(repo, f, &data, warnings);
+            let suspect = !data.is_empty();
+            let value = ReadRegion::Invalid { data, error: e.to_string() };
+            return Ok(Attempt { value, unchanged, suspect, fingerprint });
         }
     };
-    warnings.extend(parsed.warnings);
+    let data_len = data.len() as u64;
+    drop(data);
 
     let results: Vec<(ChunkEntry, Option<u64>, Option<String>)> = parsed
         .chunks
-        .par_iter()
+        .into_par_iter()
         .map(|c| -> Result<_> {
             let (bytes, verbatim, warn) = match anvil::decompress(c.compression, &c.payload) {
                 Ok(nbt) => (nbt, false, None),
                 Err(e) => {
                     let (x, z) = (c.slot % 32, c.slot / 32);
-                    (c.payload.clone(), true, Some(format!("chunk ({x},{z}): {e}; kept its raw bytes")))
+                    (c.payload, true, Some(format!("chunk ({x},{z}): {e}; kept its raw bytes")))
                 }
             };
             let put = repo.put(&bytes)?;
@@ -213,11 +302,55 @@ fn backup_region(repo: &Repo, f: &WorldFile, coords: (i32, i32)) -> Result<Done>
         })
         .collect::<Result<_>>()?;
 
-    let mut stats = Stats { files: 1, world_bytes: data.len() as u64, ..Default::default() };
+    let suspect = !parsed.warnings.is_empty() || results.iter().any(|(e, _, _)| e.verbatim);
+    let chunks = results
+        .into_iter()
+        .map(|(entry, new, warn)| {
+            if let Some(n) = new {
+                stored.insert(entry.hash, n);
+            }
+            (entry, warn)
+        })
+        .collect();
+    let value = ReadRegion::Valid {
+        data_len,
+        parsed_warnings: parsed.warnings,
+        external_files: parsed.external_files,
+        chunks,
+    };
+    Ok(Attempt { value, unchanged, suspect, fingerprint })
+}
+
+fn backup_region(repo: &Repo, f: &WorldFile, coords: (i32, i32)) -> Result<Done> {
+    // Objects this file's reads added to the repo (any attempt), with their stored size.
+    let mut stored = HashMap::new();
+    let (read, tries, settled) =
+        settle(|| read_region(repo, &f.abs, coords, &mut stored), READ_ATTEMPTS, RETRY_DELAY)?;
+    let mut warnings = Vec::new();
+    if !settled {
+        warnings.push(torn_warning(tries));
+    }
+    let (data_len, parsed_warnings, external_files, results) = match read {
+        ReadRegion::Invalid { data, error } => {
+            if !data.is_empty() {
+                warnings.push(format!("not a valid region file ({error}); stored as a plain file"));
+            }
+            let mut done = blob_done(repo, f, &data, warnings)?;
+            done.torn = !settled;
+            return Ok(done);
+        }
+        ReadRegion::Valid { data_len, parsed_warnings, external_files, chunks } => {
+            (data_len, parsed_warnings, external_files, chunks)
+        }
+    };
+    warnings.extend(parsed_warnings);
+
+    let mut stats = Stats { files: 1, world_bytes: data_len, ..Default::default() };
     let mut chunks = Vec::with_capacity(results.len());
-    for (entry, stored, warn) in results {
+    for (entry, warn) in results {
         stats.chunks += 1;
-        if let Some(n) = stored {
+        // `remove`: two identical chunks in one region are one new object, counted once.
+        if let Some(n) = stored.remove(&entry.hash) {
             stats.new_chunks += 1;
             stats.new_objects += 1;
             stats.stored_bytes += n;
@@ -225,9 +358,70 @@ fn backup_region(repo: &Repo, f: &WorldFile, coords: (i32, i32)) -> Result<Done>
         warnings.extend(warn);
         chunks.push(entry);
     }
-    let consumed: Vec<PathBuf> = parsed.external_files.iter().map(|n| dir.join(n)).collect();
+    let dir = f.abs.parent().unwrap();
+    let consumed: Vec<PathBuf> = external_files.iter().map(|n| dir.join(n)).collect();
     for p in &consumed {
         stats.world_bytes += fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     }
-    Ok(Done { entry: FileEntry::Region { path: f.rel.clone(), chunks }, stats, warnings, consumed })
+    Ok(Done {
+        entry: FileEntry::Region { path: f.rel.clone(), chunks },
+        stats,
+        warnings,
+        consumed,
+        torn: !settled,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed `settle` a scripted sequence of reads: (unchanged, suspect, fingerprint byte).
+    fn run(script: &[(bool, bool, u8)]) -> (usize, u32, bool) {
+        let mut i = 0;
+        let (value, tries, settled) = settle(
+            || {
+                let (unchanged, suspect, fp) = script[i.min(script.len() - 1)];
+                i += 1;
+                Ok(Attempt { value: i, unchanged, suspect, fingerprint: ObjectId::of(&[fp]) })
+            },
+            READ_ATTEMPTS,
+            Duration::ZERO,
+        )
+        .unwrap();
+        (value, tries, settled)
+    }
+
+    #[test]
+    fn clean_read_settles_at_once() {
+        assert_eq!(run(&[(true, false, 1)]), (1, 1, true));
+    }
+
+    #[test]
+    fn retries_while_the_file_changes() {
+        assert_eq!(run(&[(false, false, 1), (false, false, 2), (true, false, 3)]), (3, 3, true));
+    }
+
+    #[test]
+    fn damaged_but_stable_settles_on_the_second_identical_read() {
+        assert_eq!(run(&[(true, true, 7), (true, true, 7)]), (2, 2, true));
+    }
+
+    #[test]
+    fn damage_that_goes_away_was_a_torn_read() {
+        assert_eq!(run(&[(true, true, 7), (true, false, 8)]), (2, 2, true));
+    }
+
+    #[test]
+    fn damage_that_keeps_changing_never_settles() {
+        let script: Vec<_> = (0..10).map(|n| (true, true, n)).collect();
+        assert_eq!(run(&script), (5, 5, false));
+    }
+
+    #[test]
+    fn a_file_that_never_stops_changing_never_settles() {
+        assert_eq!(run(&[(false, false, 1)]), (5, 5, false));
+        // A changed read never counts as the "same" read for a damaged file either.
+        assert_eq!(run(&[(false, true, 1), (true, true, 1), (true, true, 1)]), (3, 3, true));
+    }
 }

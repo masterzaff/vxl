@@ -75,7 +75,13 @@ fn hidden() -> ProgressBar {
 }
 
 fn do_backup(env: &Env, msg: &str) -> backup::BackupReport {
-    backup::backup(&repo(env), &env.world, &[], Some(msg.into()), &hidden()).unwrap()
+    backup::backup(
+        &repo(env),
+        &env.world,
+        &backup::Options { message: Some(msg.into()), ..Default::default() },
+        &hidden(),
+    )
+    .unwrap()
 }
 
 fn do_restore(env: &Env, id: &ObjectId, name: &str) -> std::path::PathBuf {
@@ -273,7 +279,7 @@ fn refuses_repo_inside_world() {
     let repo_dir = world.join("backups");
     Repo::init(&repo_dir, 3, TEST_PACK_SIZE).unwrap();
     let repo = Repo::open(&repo_dir, LockMode::Exclusive).unwrap();
-    let err = backup::backup(&repo, &world, &[], None, &hidden()).err().unwrap();
+    let err = backup::backup(&repo, &world, &backup::Options::default(), &hidden()).err().unwrap();
     assert!(err.to_string().contains("inside the world"));
 }
 
@@ -484,7 +490,13 @@ fn without_lock(mut c: BTreeMap<String, Content>) -> BTreeMap<String, Content> {
 fn server_folder_backs_up_every_world_as_one_snapshot() {
     let env = setup();
     let s = server(&env);
-    let r = backup::backup(&repo(&env), &s, &[], Some("all".into()), &hidden()).unwrap();
+    let r = backup::backup(
+        &repo(&env),
+        &s,
+        &backup::Options { message: Some("all".into()), ..Default::default() },
+        &hidden(),
+    )
+    .unwrap();
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     let names: Vec<_> = r.worlds.iter().map(|w| (w.name.as_str(), w.rel.as_str())).collect();
     assert_eq!(names, [("world", "world"), ("world_nether", "world_nether"), ("lobby", "worlds/lobby")]);
@@ -523,7 +535,13 @@ fn server_folder_backs_up_every_world_as_one_snapshot() {
 
     // Selecting fewer worlds.
     let some = ["*".to_string(), "!lobby".to_string()];
-    let r2 = backup::backup(&repo(&env), &s, &some, None, &hidden()).unwrap();
+    let r2 = backup::backup(
+        &repo(&env),
+        &s,
+        &backup::Options { worlds: some.to_vec(), ..Default::default() },
+        &hidden(),
+    )
+    .unwrap();
     assert_eq!(repo(&env).load_header(&r2.id).unwrap().world_names, ["world", "world_nether"]);
     assert_eq!(r2.stats.new_chunks, 0);
 }
@@ -533,9 +551,9 @@ fn copied_worlds_are_stored_once() {
     let env = setup();
     let s = env.base.join("server");
     synth::write_world(&s.join("arena1"), 30, &[(0, 0)], 50, Compression::Zlib, |_, _| 0).unwrap();
-    let one = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap();
+    let one = backup::backup(&repo(&env), &s, &backup::Options::default(), &hidden()).unwrap();
     synth::write_world(&s.join("arena2"), 30, &[(0, 0)], 50, Compression::Zlib, |_, _| 0).unwrap();
-    let two = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap();
+    let two = backup::backup(&repo(&env), &s, &backup::Options::default(), &hidden()).unwrap();
     assert_eq!(two.stats.chunks, 100);
     assert_eq!(two.stats.new_chunks, 0, "arena2 is a copy of arena1");
     assert!(two.stats.stored_bytes < one.stats.stored_bytes / 20);
@@ -545,7 +563,7 @@ fn copied_worlds_are_stored_once() {
 fn restoring_a_server_over_itself_touches_only_worlds() {
     let env = setup();
     let s = server(&env);
-    let id = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap().id;
+    let id = backup::backup(&repo(&env), &s, &backup::Options::default(), &hidden()).unwrap().id;
     let before: Vec<_> =
         ["world", "world_nether", "worlds/lobby"].map(|w| without_lock(contents(&s.join(w)))).into();
 
@@ -570,7 +588,7 @@ fn a_failed_multi_world_restore_changes_nothing() {
     let s = env.base.join("server");
     synth::write_world(&s.join("a"), 40, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
     synth::write_world(&s.join("b"), 41, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
-    let id = backup::backup(&repo(&env), &s, &[], None, &hidden()).unwrap().id;
+    let id = backup::backup(&repo(&env), &s, &backup::Options::default(), &hidden()).unwrap().id;
 
     // Both worlds move on, then one object of `b` gets damaged.
     synth::write_world(&s.join("a"), 40, &[(0, 0)], 20, Compression::Zlib, |_, _| 3).unwrap();

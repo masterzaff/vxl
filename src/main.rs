@@ -60,6 +60,10 @@ enum Cmd {
         /// and, on success, VXL_SNAPSHOT=<id>.
         #[arg(long, value_name = "CMD")]
         post: Option<String>,
+        /// Fail instead of warning if a file keeps changing while vxl reads it (a sign the
+        /// server is still saving), so no possibly torn snapshot is saved.
+        #[arg(long)]
+        strict: bool,
         #[command(flatten)]
         repo: RepoArg,
         /// Note to attach to the snapshot.
@@ -173,7 +177,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("initialized empty vxl repository in {}", path.display());
         }
 
-        Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post } => {
+        Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post, strict } => {
             // Lock first: if another backup is running, fail before pausing the server.
             let repo = open(&repo_arg, LockMode::Exclusive)?;
             // Hooks run in our own working directory: SOURCE may not exist until `pre` ran.
@@ -194,7 +198,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let pb = bar("backing up", true);
             let out = hooks.around(
                 || {
-                    let r = backup::backup(&repo, &source, &worlds, message, &pb);
+                    let opts = backup::Options { worlds, message, strict };
+                    let r = backup::backup(&repo, &source, &opts, &pb);
                     pb.finish_and_clear();
                     r
                 },

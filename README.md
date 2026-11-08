@@ -79,8 +79,13 @@ doesn't know how your server runs; you tell it with two shell commands:
 
 They run through `sh -c` (`cmd /C` on Windows) in vxl's working directory, with
 `VXL_SOURCE` and `VXL_REPO` set; `--post` also gets `VXL_RESULT` (`ok`, `failed` or
-`interrupted`) and, on success, `VXL_SNAPSHOT` (the snapshot id). Even without hooks, vxl
-warns if a file changes while it reads it.
+`interrupted`) and, on success, `VXL_SNAPSHOT` (the snapshot id).
+
+Hooks or not, vxl checks every read: a file whose size or modification time changed while it
+was being read, or a region file with damaged chunks, is read again (up to 5 times, waiting a
+little longer each time). A damaged file that reads the same twice is damaged on disk, not
+torn, and is kept exactly as it is. A file that never settles is stored as last read with a
+warning; with `--strict` the backup fails instead, so no possibly torn snapshot is saved.
 
 **Docker** ([itzg/minecraft-server](https://github.com/itzg/docker-minecraft-server) has
 `rcon-cli` built in):

@@ -77,10 +77,11 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
    `VXL_RESULT` and `VXL_SNAPSHOT`. `post` runs in its own process group so a Ctrl-C
    doesn't kill it too. The same mechanism covers
    RCON, `docker exec`, panel APIs, tmux, stopping the server, or ZFS/btrfs snapshots.
-3. **Torn-read detection.** vxl parses every chunk anyway, so it can catch a region file
+3. ✅ **Torn-read detection.** vxl parses every chunk anyway, so it can catch a region file
    that changed mid-read (bad chunk length, failed decompression, size or mtime changed
-   between start and end of the read). Re-read that region a few times; warn, or fail with
-   `--strict`, if it never settles. Makes hook-less backups safe in practice and double-checks
+   between start and end of the read). Re-read it up to 5 times; a damaged file that reads
+   identically twice is damaged on disk and kept as is; warn, or fail with `--strict`, if it
+   never settles. Blobs (`level.dat`, `playerdata/`) are re-read on size/mtime changes too. Makes hook-less backups safe in practice and double-checks
    hooked ones.
 4. ✅ **Hook recipes in the README**, ready to paste: RCON (`mcrcon`), itzg Docker
    (`docker exec mc rcon-cli`), tmux `send-keys`, ZFS snapshot, stop/start. A built-in RCON
