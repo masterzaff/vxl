@@ -26,6 +26,8 @@ use crate::manifest::{Snapshot, SnapshotHeader};
 use crate::pack::{self, Builder, Entry};
 use crate::util::{atomic_write, sync_dir};
 
+/// How long `open` waits for a lock someone else holds before reporting the repo busy.
+pub const LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Repository layout version. v1 (loose object files) only existed in early dev builds.
 pub const REPO_VERSION: u32 = 2;
 /// Default zstd level for objects. Chosen by `examples/zstd_levels.rs`: past
@@ -203,13 +205,22 @@ impl Repo {
             LockMode::None => None,
             mode => {
                 let f = File::options().create(true).truncate(false).write(true).open(path.join("lock"))?;
-                let res = if mode == LockMode::Exclusive { f.try_lock() } else { f.try_lock_shared() };
-                match res {
-                    Ok(()) => Some(f),
-                    Err(TryLockError::WouldBlock) => {
-                        bail!("repository is busy: another vxl command is using it right now")
+                // Wait a moment before giving up: the lock may be held only briefly (a
+                // command just finishing, or a freshly forked child that hasn't exec'd yet
+                // and still holds a copy of the descriptor).
+                let deadline = std::time::Instant::now() + LOCK_GRACE;
+                loop {
+                    let res = if mode == LockMode::Exclusive { f.try_lock() } else { f.try_lock_shared() };
+                    match res {
+                        Ok(()) => break Some(f),
+                        Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        Err(TryLockError::WouldBlock) => {
+                            bail!("repository is busy: another vxl command is using it right now")
+                        }
+                        Err(TryLockError::Error(e)) => return Err(e).context("locking repository"),
                     }
-                    Err(TryLockError::Error(e)) => return Err(e).context("locking repository"),
                 }
             }
         };

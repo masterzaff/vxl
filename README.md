@@ -448,7 +448,8 @@ byte-identical; zero fallbacks.
   million distinct chunks across all snapshots.
 - Repositories made by the first development build (loose object files, format v1)
   can't be opened; create a new one.
-- `list` reads every manifest; fine up to hundreds of snapshots.
+- `list` and `prune` read snapshot headers from a cache (`cache/headers/`); the first time
+  after upgrading, they read every manifest once to fill it.
 
 ## Code map (for reading the source)
 
@@ -459,10 +460,15 @@ byte-identical; zero fallbacks.
 | `src/repo.rs` | repository, locking, object store (`put`/`get`/`repack`), snapshot storage |
 | `src/pack.rs` | the pack file format (pure: bytes in, bytes out) |
 | `src/manifest.rs` | the snapshot data structures (serde) |
-| `src/world.rs` | walks a world folder and classifies files |
-| `src/commands/*.rs` | one file per subcommand, each returns a report struct |
+| `src/world.rs` | finds the worlds in a server folder, walks a world and classifies files |
+| `src/hooks.rs` | `--pre`/`--post` commands and Ctrl-C/SIGTERM handling |
+| `src/config.rs` | `vxl.toml` |
+| `src/retention.rs` | which snapshots `prune` keeps (`--keep-daily` etc.) |
+| `src/commands/*.rs` | one file per subcommand (`partial.rs`: `restore --area/--dimension`), each returns a report struct |
 | `src/synth.rs` | synthetic world generator for tests/benchmarks |
-| `tests/roundtrip.rs` | end-to-end tests: backup → change → restore → prune |
+| `tests/roundtrip.rs` | end-to-end tests: backup → change → restore → prune, CLI |
+| `tests/hooks.rs` | hook ordering and failure handling (own binary: it spawns processes) |
+| `tests/robustness.rs` | mutation tests: damaged regions, chunks, NBT and packs must error, not panic |
 
 ```bash
 cargo test                       # all tests
