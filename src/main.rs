@@ -2,12 +2,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use vxl::commands::{backup, compare, list, prune, restore, verify};
+use vxl::config::Config;
 use vxl::hooks::{self, Hooks};
 use vxl::repo::{self, LockMode, Repo};
 use vxl::retention::Policy;
@@ -17,15 +18,28 @@ use vxl::util::{human_bytes, thousands};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Config file with source, repo, worlds, hooks and retention (default: ./vxl.toml if
+    /// it exists). Command-line options override it.
+    #[arg(long, short = 'c', global = true, env = "VXL_CONFIG", value_name = "FILE")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(clap::Args)]
 struct RepoArg {
-    /// Path to the vxl repository.
+    /// Path to the vxl repository (default: `repo` in the config file).
     #[arg(long, short = 'r', env = "VXL_REPO")]
-    repo: PathBuf,
+    repo: Option<PathBuf>,
+}
+
+impl RepoArg {
+    fn path(&self, cfg: &Config) -> Result<PathBuf> {
+        match self.repo.as_ref().or(cfg.repo.as_ref()) {
+            Some(p) => Ok(p.clone()),
+            None => bail!("no repository given: pass --repo, set VXL_REPO, or set `repo` in vxl.toml"),
+        }
+    }
 }
 
 #[derive(clap::Args)]
@@ -67,7 +81,8 @@ impl KeepArgs {
 enum Cmd {
     /// Create a new, empty repository.
     Init {
-        path: PathBuf,
+        /// Where to create it (default: `repo` in the config file).
+        path: Option<PathBuf>,
         /// zstd level for stored chunks (1–22). Higher = smaller but slower backups.
         #[arg(long, default_value_t = repo::DEFAULT_ZSTD_LEVEL)]
         zstd_level: i32,
@@ -80,7 +95,8 @@ enum Cmd {
     Backup {
         /// A world folder, or a server folder: then every folder with a level.dat up to two
         /// levels down is a world (except in plugins/, backups/, logs/ and similar).
-        source: PathBuf,
+        /// Default: `source` in the config file.
+        source: Option<PathBuf>,
         /// Which worlds to back up: a folder name (`world_nether`), a path under SOURCE
         /// (`worlds/lobby`), `*` for all, `!name` to leave one out. Repeatable; default `*`.
         #[arg(long = "world", short = 'w', value_name = "WORLD")]
@@ -214,8 +230,8 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn open(r: &RepoArg, lock: LockMode) -> Result<Repo> {
-    let repo = Repo::open(&r.repo, lock)?;
+fn open(r: &RepoArg, cfg: &Config, lock: LockMode) -> Result<Repo> {
+    let repo = Repo::open(&r.path(cfg)?, lock)?;
     print_warnings(&repo.warnings);
     Ok(repo)
 }
@@ -244,20 +260,31 @@ fn print_removal(r: &prune::PruneReport, dry_run: bool) {
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
+    // `compare` works on plain folders and never needs a config.
+    let cfg = match cli.cmd {
+        Cmd::Compare { .. } => Config::default(),
+        _ => Config::find(cli.config.as_deref())?.0,
+    };
     match cli.cmd {
         Cmd::Init { path, zstd_level, pack_size_mb } => {
+            let path = RepoArg { repo: path }.path(&cfg)?;
             Repo::init(&path, zstd_level, pack_size_mb << 20)?;
             println!("initialized empty vxl repository in {}", path.display());
         }
 
         Cmd::Backup { source, worlds, repo: repo_arg, message, pre, post, strict } => {
             // Lock first: if another backup is running, fail before pausing the server.
-            let repo = open(&repo_arg, LockMode::Exclusive)?;
+            let repo = open(&repo_arg, &cfg, LockMode::Exclusive)?;
+            let Some(source) = source.or(cfg.source.clone()) else {
+                bail!("nothing to back up: pass a world or server folder, or set `source` in vxl.toml");
+            };
+            let worlds = if worlds.is_empty() { cfg.worlds.selectors() } else { worlds };
+            let strict = strict || cfg.strict;
             // Hooks run in our own working directory: SOURCE may not exist until `pre` ran.
             let abs = |p: &std::path::Path| std::path::absolute(p).map(|p| p.display().to_string());
             let hooks = Hooks {
-                pre,
-                post,
+                pre: pre.or(cfg.hooks.pre.clone()),
+                post: post.or(cfg.hooks.post.clone()),
                 env: vec![
                     ("VXL_SOURCE".into(), abs(&source).context("resolving the source path")?),
                     ("VXL_REPO".into(), abs(repo.root()).context("resolving the repo path")?),
@@ -314,7 +341,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Cmd::List { repo } => {
-            let repo = open(&repo, LockMode::None)?;
+            let repo = open(&repo, &cfg, LockMode::None)?;
             let snaps = list::list(&repo)?;
             if snaps.is_empty() {
                 println!("no snapshots yet");
@@ -339,7 +366,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Cmd::Restore { snapshot, target, world, force, force_wipe, repo } => {
-            let repo = open(&repo, LockMode::Shared)?;
+            let repo = open(&repo, &cfg, LockMode::Shared)?;
             let id = repo.resolve(&snapshot)?;
             let mode = match (force, force_wipe) {
                 (_, true) => restore::Mode::Wipe,
@@ -379,8 +406,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Cmd::Prune { keep, dry_run, repo } => {
-            let repo = open(&repo, LockMode::Exclusive)?;
-            let r = prune::prune(&repo, &keep.policy(), dry_run)?;
+            let repo = open(&repo, &cfg, LockMode::Exclusive)?;
+            let r = prune::prune(&repo, &cfg.policy(&keep.policy()), dry_run)?;
             if dry_run {
                 for (id, why) in &r.kept_by {
                     let why: Vec<&str> = why.iter().map(|p| p.name()).collect();
@@ -391,7 +418,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Cmd::Delete { snapshots, dry_run, repo } => {
-            let repo = open(&repo, LockMode::Exclusive)?;
+            let repo = open(&repo, &cfg, LockMode::Exclusive)?;
             let ids = snapshots.iter().map(|s| repo.resolve(s)).collect::<Result<Vec<_>>>()?;
             let r = prune::delete(&repo, &ids, dry_run)?;
             print_removal(&r, dry_run);
@@ -433,7 +460,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Cmd::Verify { snapshot, repo } => {
-            let repo = open(&repo, LockMode::Shared)?;
+            let repo = open(&repo, &cfg, LockMode::Shared)?;
             let ids = match snapshot {
                 Some(s) => vec![repo.resolve(&s)?],
                 None => repo.snapshot_ids()?,

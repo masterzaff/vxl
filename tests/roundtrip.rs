@@ -813,3 +813,86 @@ fn cli_prune_policies_and_delete() {
         .unwrap();
     assert!(!bad.status.success());
 }
+
+#[test]
+fn cli_config_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    synth::write_world(&dir.join("server/world"), 80, &[(0, 0)], 10, Compression::Zlib, |_, _| 0).unwrap();
+    synth::write_world(&dir.join("server/creative"), 81, &[(0, 0)], 10, Compression::Zlib, |_, _| 0).unwrap();
+    // Relative paths are relative to the file.
+    fs::write(
+        dir.join("vxl.toml"),
+        r#"
+source = "server"
+repo = "repo"
+worlds = ["*", "!creative"]
+
+[hooks]
+post = "echo post>> hooks.log"
+
+[keep]
+last = 1
+"#,
+    )
+    .unwrap();
+    let vxl = |cwd: &Path, args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_vxl"))
+            .args(args)
+            .current_dir(cwd)
+            .env_remove("VXL_REPO")
+            .env_remove("VXL_CONFIG")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+
+    // ./vxl.toml is picked up: no arguments needed at all.
+    vxl(dir, &["init"]);
+    assert!(dir.join("repo/config.json").exists());
+    let out = vxl(dir, &["backup"]);
+    assert!(out.starts_with("worlds: world\n") && out.contains("| 10 chunks |"), "{out}");
+    assert_eq!(fs::read_to_string(dir.join("hooks.log")).unwrap().trim(), "post");
+    vxl(dir, &["backup", "-m", "second"]);
+
+    // [keep] last = 1 applies…
+    let out = vxl(dir, &["prune", "--dry-run"]);
+    assert!(out.contains("would remove 1 snapshots, kept 1"), "{out}");
+    // …unless the command line has rules of its own.
+    let out = vxl(dir, &["prune", "--keep-last", "5", "--dry-run"]);
+    assert!(out.contains("would remove 0 snapshots, kept 2"), "{out}");
+
+    // Command-line options win over the file; --config works from anywhere.
+    let cfg = dir.join("vxl.toml");
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let out = vxl(&elsewhere, &["--config", cfg.to_str().unwrap(), "backup", "-w", "creative"]);
+    assert!(out.starts_with("worlds: creative\n"), "{out}");
+    let listing = vxl(&elsewhere, &["list", "-c", cfg.to_str().unwrap()]);
+    assert_eq!(listing.lines().count(), 3, "{listing}");
+
+    // A typo in the file is an error, not silently ignored.
+    fs::write(dir.join("vxl.toml"), "[keep]\ndialy = 7\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vxl"))
+        .args(["list", "--repo", dir.join("repo").to_str().unwrap()])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("dialy"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Without a config, a missing repo is explained.
+    let out = Command::new(env!("CARGO_BIN_EXE_vxl"))
+        .args(["list"])
+        .current_dir(&elsewhere)
+        .env_remove("VXL_REPO")
+        .env_remove("VXL_CONFIG")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no repository given"));
+}

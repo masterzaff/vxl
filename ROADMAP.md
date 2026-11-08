@@ -87,8 +87,10 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
    (`docker exec mc rcon-cli`), tmux `send-keys`, ZFS snapshot, stop/start. A built-in RCON
    client is sugar for later, only if people keep asking. The README also states the scope:
    which files get chunk-level dedup (Anvil `.mca`/`.mcc`) and which are stored whole.
-5. **Config file (`vxl.toml`).** Source, repo, hooks and retention in one place, so plain
-   `vxl backup` does everything. README gets cron and systemd-timer examples.
+5. ✅ **Config file (`vxl.toml`).** Source, repo, worlds, hooks, strict and retention in one
+   place (`./vxl.toml`, or `--config` / `VXL_CONFIG`), so plain `vxl backup && vxl prune`
+   does everything. Command-line options win; unknown keys are errors. README has cron and
+   systemd-timer examples.
 6. ✅ **`vxl delete <id>…`.** Delete specific snapshots and garbage-collect in one step,
    under the repo lock. (Today: remove `snapshots/<id>.json.zst`, then `vxl prune`.)
 7. ✅ **Retention policies.** `--keep-last 5 --keep-daily 7 --keep-weekly 4 --keep-monthly 6`

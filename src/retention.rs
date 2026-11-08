@@ -44,18 +44,6 @@ impl Policy {
             (Period::Yearly, self.yearly),
         ]
     }
-
-    /// Settings from `other` win where it has them.
-    pub fn overridden_by(&self, other: &Policy) -> Policy {
-        Policy {
-            last: other.last.or(self.last),
-            hourly: other.hourly.or(self.hourly),
-            daily: other.daily.or(self.daily),
-            weekly: other.weekly.or(self.weekly),
-            monthly: other.monthly.or(self.monthly),
-            yearly: other.yearly.or(self.yearly),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,15 +242,5 @@ mod tests {
         assert_eq!(apply(&p, &snaps, &Utc).iter().filter(|d| !d.kept_by.is_empty()).count(), 2);
         let minus2 = chrono::FixedOffset::west_opt(2 * 3600).unwrap();
         assert_eq!(apply(&p, &snaps, &minus2).iter().filter(|d| !d.kept_by.is_empty()).count(), 1);
-    }
-
-    #[test]
-    fn override_merges() {
-        let base = Policy { daily: Some(7), weekly: Some(4), ..Default::default() };
-        let cli = Policy { daily: Some(2), last: Some(1), ..Default::default() };
-        assert_eq!(
-            base.overridden_by(&cli),
-            Policy { last: Some(1), daily: Some(2), weekly: Some(4), ..Default::default() }
-        );
     }
 }

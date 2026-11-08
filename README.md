@@ -26,7 +26,8 @@ $ vxl verify --repo /backups/survival-repo
 $ vxl prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --repo /backups/survival-repo
 ```
 
-Set `VXL_REPO=/backups/survival-repo` to skip `--repo` every time.
+Set `VXL_REPO=/backups/survival-repo` to skip `--repo` every time, or put everything in a
+[config file](#config-file-and-scheduling).
 
 ## Install
 
@@ -38,8 +39,8 @@ cargo install --path .
 
 | command | what it does |
 |---|---|
-| `init <path> [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: level 6, 16 MiB packs) |
-| `backup <folder> [-w world]… [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
+| `init [path] [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: level 6, 16 MiB packs) |
+| `backup [folder] [-w world]… [--pre cmd] [--post cmd] [--strict] [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
 | `list` | snapshots, newest first, with what each one added and which worlds it holds |
 | `restore <id> <folder> [-w world] [--force \| --force-wipe]` | rebuild a snapshot (or one world of it) into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
@@ -47,7 +48,70 @@ cargo install --path .
 | `prune [--keep-last/hourly/daily/weekly/monthly/yearly N]… [--dry-run]` | drop snapshots no rule keeps, delete/compact packs holding data nothing references (see below) |
 | `delete <id>… [--dry-run]` | drop exactly these snapshots and collect the data only they used |
 
-Snapshot ids can be shortened to any unique prefix, like git.
+Snapshot ids can be shortened to any unique prefix, like git. Every command takes
+`-c/--config <file>` (see below).
+
+## Config file and scheduling
+
+Instead of repeating options, put them in `vxl.toml`. vxl reads `./vxl.toml` if it exists,
+or the file given with `--config` / `VXL_CONFIG`:
+
+```toml
+source = "/srv/mc"              # a world, or a server folder
+repo = "/backups/mc-repo"
+worlds = ["*", "!creative"]     # optional; "*" (all) is the default
+strict = false                  # true = fail rather than save a possibly torn snapshot
+
+[hooks]
+pre = "docker exec mc rcon-cli save-off && docker exec mc rcon-cli save-all flush"
+post = "docker exec mc rcon-cli save-on"
+
+[keep]                          # retention for `vxl prune`
+daily = 7
+weekly = 4
+monthly = 6
+```
+
+Relative paths are relative to the file. Command-line options win: `--repo`/`VXL_REPO`, a
+folder argument, `-w`, `--pre`/`--post`. If `prune` gets any `--keep-*` rule, the file's
+`[keep]` is ignored entirely, so what you type is exactly what applies. Unknown keys are an
+error, so a typo like `dialy = 7` can't silently keep nothing.
+
+With that in place a nightly backup is one line. **cron** (`crontab -e`):
+
+```cron
+30 4 * * *  vxl -c /srv/mc/vxl.toml backup -m nightly && vxl -c /srv/mc/vxl.toml prune
+```
+
+**systemd timer** (`/etc/systemd/system/vxl.service` and `vxl.timer`):
+
+```ini
+# vxl.service
+[Unit]
+Description=vxl backup of the Minecraft server
+
+[Service]
+Type=oneshot
+Environment=VXL_CONFIG=/srv/mc/vxl.toml
+ExecStart=/usr/local/bin/vxl backup -m nightly
+ExecStartPost=/usr/local/bin/vxl prune
+```
+
+```ini
+# vxl.timer
+[Unit]
+Description=Nightly vxl backup
+
+[Timer]
+OnCalendar=*-*-* 04:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable with `systemctl enable --now vxl.timer`. If systemd stops the backup (SIGTERM),
+the post hook still runs.
 
 ## Retention
 
