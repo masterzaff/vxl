@@ -8,7 +8,10 @@ any host). Bedrock (LevelDB worlds) is out of scope. Non-Anvil files a Java serv
 (old `.mcr` regions, the `.linear` format of some Paper forks) are still backed up, but
 stored whole, without chunk-level dedup.
 
-## Where things stand (v0.1)
+## Where things stand
+
+**v0.2.0** is the first release: Phases 1–3 and most of Phase 4 below. The first checks,
+before any of that:
 
 Validated on a real Paper survival world, 3 days of copies (119k → 131k chunks):
 
@@ -25,7 +28,7 @@ Validated on a real Paper survival world, 3 days of copies (119k → 131k chunks
 Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Windows
 (CI passes there).
 
-## Phase 1: safe nightly backups of any Java server (v0.2)
+## Phase 1: safe nightly backups of any Java server
 
 *Goal: one cron line backs up everything, correctly, every night.*
 
@@ -105,7 +108,7 @@ snapshot, and a restore of it loads cleanly:
 - a modded server with custom dimensions (`world/dimensions/<mod>/…`);
 - a server in Docker (itzg image), quiesced through a hook.
 
-## Phase 2: restores that fit how servers break (v0.3)
+## Phase 2: restores that fit how servers break
 
 *Goal: roll back a griefed spawn without rolling back everyone's progress.*
 
@@ -200,7 +203,7 @@ Steps:
   static x86_64 and arm64 Linux (musl; arm64 cross-built with cargo-zigbuild, so its tests
   run only on the other targets), arm64 macOS and x86_64 Windows binaries plus `SHA256SUMS`;
   running it by hand is a dry run (verified, arm64 binary checked to be static aarch64).
-  Still open: cutting the first release.
+  First release: v0.2.0.
 
 ## Open questions
 
