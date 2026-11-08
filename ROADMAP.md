@@ -156,7 +156,9 @@ Steps:
 - **Fuzzing** the parsers that read untrusted bytes (anvil, NBT, pack). ✅ Stable-Rust
   mutation tests (`tests/robustness.rs`: flips, extreme lengths, truncation, splices, hostile
   nesting) run with every `cargo test`; they found an overflow in the pack-index bounds check
-  (fixed). Still open: coverage-guided `cargo-fuzz` targets (needs nightly).
+  (fixed). Coverage-guided `cargo-fuzz` targets (`fuzz/`: region, chunk_payload, nbt with
+  byte-exact write-back, pack_index, index_cache) run weekly on nightly in CI; first run:
+  ~26M inputs, no crashes.
 - ✅ **Big-repo speed.** Snapshot headers are cached (`cache/headers/`), so `list` and
   `prune` don't decompress whole manifests, and all pack indexes are cached in one
   checksummed file (`cache/packs.idx`), checked against the pack files on every open, so
