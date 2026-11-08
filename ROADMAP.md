@@ -30,22 +30,38 @@ Untested: LZ4-compressed worlds (`region-file-compression=lz4`), real use on Win
 *Goal: one cron line backs up everything, correctly, every night.*
 
 1. **Whole-server snapshots.** `vxl backup ~/server` backs up several worlds as **one
-   snapshot**. Which worlds is set by `worlds` in the config (`--world` on the CLI):
-   - `"*"` (the default) or `["*"]`: every top-level folder with a `level.dat`;
+   snapshot**, and only worlds: plugins, configs, logs and jars are left to a normal file
+   backup. Which worlds is set by `worlds` in the config (`--world` on the CLI):
+   - `"*"` (the default) or `["*"]`: every world found;
    - `["world", "world_nether", "lobby"]`: exactly these;
    - `["*", "!creative"]`: all but some.
 
-   A world is a folder with a `level.dat`; everything inside it belongs to it, so the
-   nested dimensions of vanilla/Fabric/Forge (`world/DIM-1`, `world/DIM1`,
-   `world/dimensions/<mod>/<name>/`) come along with `world`, while Paper's separate
-   `world_nether` / `world_the_end` and Multiverse worlds are matched as their own entries.
-   A world nested inside another matched world isn't counted twice.
+   **What counts as a world:** a folder with a `level.dat`, found up to two levels below the
+   server folder (so `world/` and `worlds/world1/`, e.g. with Paper's `--world-container`).
+   Search stops descending once it finds one, and skips `plugins/`, `backups/`, `logs/`,
+   `cache/` and `libraries/` so a plugin's own world copies aren't picked up. Every backup
+   prints the worlds it found.
 
-   **Storage:** manifest paths become relative to the server folder
-   (`world_nether/DIM-1/region/r.0.0.mca`) and the header lists the worlds. Objects stay
-   repo-wide and content-addressed, so nothing changes in the packs and identical content
-   across worlds (a copied lobby, the same `level.dat` pieces) is stored once. Restore
-   gets `--only world_nether`, which is just a path-prefix filter.
+   **A world is named by its own folder:** `worlds/world1` is stored as `world1`. Two
+   matched worlds with the same name (`a/world1`, `b/world1`) are an error naming both
+   paths; pick one by listing its path (`"a/world1"`) instead of `"*"`. Everything inside a world belongs to it, so
+   the nested dimensions of vanilla/Fabric/Forge (`world/DIM-1`, `world/DIM1`,
+   `world/dimensions/<mod>/<name>/`) come along with `world`, while Paper's separate
+   `world_nether` / `world_the_end` and Multiverse worlds are worlds of their own. A matched
+   world that is a symlink is followed (inside a world, symlinks are still skipped).
+
+   **Storage:** a snapshot becomes a list of worlds, each with its name, where it was found,
+   and its own file list with paths relative to that world, exactly like today's
+   single-world manifest. Objects stay repo-wide and content-addressed, so the packs don't
+   change and identical content across worlds is stored once. The manifest version goes up
+   by one; older snapshots read as a single world named after their source folder.
+
+   **Restore:** `vxl restore <id> <dest>` writes every world to `<dest>/<name>/`;
+   `--world abc` writes just that one as a standalone world folder, ready to load or hand
+   to someone. A world's blocks restore on their own, but player data (inventories,
+   positions, stats, advancements) lives only in the main world's `playerdata/`,
+   `stats/` and `advancements/`, so restoring just `world_nether` doesn't roll back anyone's
+   inventory. The docs must say so.
    *First because today the Nether and End are easy to miss entirely.*
 2. **Pre/post hooks.** vxl doesn't know how the server runs; it just needs the world
    consistent on disk while it reads. `pre` and `post` are shell commands (`--pre` /
