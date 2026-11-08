@@ -81,8 +81,10 @@ impl KeepArgs {
 enum Cmd {
     /// Create a new, empty repository.
     Init {
-        /// Where to create it (default: `repo` in the config file).
+        /// Where to create it (wins over --repo, VXL_REPO and `repo` in the config file).
         path: Option<PathBuf>,
+        #[command(flatten)]
+        repo: RepoArg,
         /// zstd level for stored chunks (1–22). Higher = smaller but slower backups.
         #[arg(long, default_value_t = repo::DEFAULT_ZSTD_LEVEL)]
         zstd_level: i32,
@@ -312,8 +314,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         _ => Config::find(cli.config.as_deref())?.0,
     };
     match cli.cmd {
-        Cmd::Init { path, zstd_level, pack_size_mb, format } => {
-            let path = RepoArg { repo: path }.path(&cfg)?;
+        Cmd::Init { path, repo, zstd_level, pack_size_mb, format } => {
+            // A path given right here wins over --repo / VXL_REPO / the config file.
+            let path = RepoArg { repo: path.or(repo.repo) }.path(&cfg)?;
             Repo::init_format(&path, zstd_level, pack_size_mb << 20, format)?;
             println!("initialized empty vxl repository (format {format}) in {}", path.display());
         }

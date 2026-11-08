@@ -316,6 +316,42 @@ fn cli_smoke() {
     assert!(vxl(&["prune", "--keep-last", "1"]).contains("removed 0 snapshots"));
 }
 
+/// `init` finds its repo like every other command, and a path given to it wins.
+#[test]
+fn cli_init_takes_the_repo_like_everything_else() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |args: &[&str], env: Option<&Path>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_vxl"));
+        c.args(args).current_dir(tmp.path()).env_remove("VXL_REPO").env_remove("VXL_CONFIG");
+        if let Some(e) = env {
+            c.env("VXL_REPO", e);
+        }
+        c.output().unwrap()
+    };
+    let p = |n: &str| tmp.path().join(n);
+    let s = |n: &str| p(n).to_str().unwrap().to_string();
+    for (args, env, made) in [
+        (vec!["init".to_string(), s("a")], None, "a"),
+        (vec!["init".into(), "--repo".into(), s("b")], None, "b"),
+        (vec!["init".into(), "-r".into(), s("c")], None, "c"),
+        (vec!["init".into()], Some(p("d")), "d"),
+        (vec!["init".into(), s("e")], Some(p("not-this")), "e"),
+    ] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run(&args, env.as_deref());
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(p(made).join("config.json").exists(), "{args:?}");
+    }
+    assert!(!p("not-this").exists());
+    fs::write(p("vxl.toml"), "repo = \"f\"\n").unwrap();
+    assert!(run(&["init"], None).status.success());
+    assert!(p("f").join("config.json").exists(), "from vxl.toml, relative to it");
+    fs::remove_file(p("vxl.toml")).unwrap();
+    let err = run(&["init"], None);
+    assert!(!err.status.success());
+    assert!(String::from_utf8_lossy(&err.stderr).contains("pass --repo"));
+}
+
 /// A world that has moved on since the snapshot: edited chunks, a newer
 /// level.dat, and a region + file the snapshot never had.
 fn diverge(env: &Env) {

@@ -43,7 +43,7 @@ cargo install --path .
 
 | command | what it does |
 |---|---|
-| `init [path] [--format 2\|3] [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: format 3, level 6, 16 MiB packs; see [storage formats](#storage-formats)) |
+| `init [path] [--format 2\|3] [--zstd-level N] [--pack-size-mb N]` | create an empty repository at `path` or wherever `--repo`/`VXL_REPO`/`vxl.toml` say (defaults: format 3, level 6, 16 MiB packs; see [storage formats](#storage-formats)) |
 | `migrate [--to 2\|3]` | convert a repository to another storage format (default 3) |
 | `backup [folder] [-w world]… [--pre cmd] [--post cmd] [--strict] [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
 | `list` | snapshots, newest first, with what each one added and which worlds it holds |
