@@ -1,29 +1,38 @@
-//! The repository: config, lock, content-addressed object store, snapshots.
+//! The repository: config, lock, pack-based object store, snapshots.
 //!
 //! ```text
 //! repo/
-//!   config.json             format version + zstd level
-//!   lock                    flock'd by every command that reads or writes objects
-//!   objects/ab/cdef…        zstd(data), named by BLAKE3(data)
+//!   config.json             format version, zstd level, pack size
+//!   lock                    OS file lock (backup/prune exclusive, restore/verify shared)
+//!   packs/<id>.pack         many zstd-compressed objects + an index (see `pack.rs`)
 //!   snapshots/<id>.json.zst manifests
 //!   tmp/                    staging area for atomic writes
 //! ```
+//!
+//! Objects are named by the BLAKE3 of their *uncompressed* content. On open we
+//! read every pack's index into memory: object id → (pack, offset, length).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{FORMAT_VERSION, Snapshot, SnapshotHeader};
+use crate::manifest::{Snapshot, SnapshotHeader};
+use crate::pack::{self, Builder, Entry};
 use crate::util::{atomic_write, sync_dir};
 
+/// Repository layout version. v1 (loose object files) only existed in early dev builds.
+pub const REPO_VERSION: u32 = 2;
 /// Default zstd level for objects. Chosen by `examples/zstd_levels.rs`: past
 /// this point each extra level costs a lot of speed for very little space.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 6;
+/// Target pack size. Big enough that a large world is a few hundred files,
+/// small enough that repacking one during prune is quick.
+pub const DEFAULT_PACK_SIZE: u64 = 16 << 20;
 const MANIFEST_ZSTD_LEVEL: i32 = 9;
 
 // ---------------------------------------------------------------------------
@@ -73,17 +82,20 @@ impl<'de> Deserialize<'de> for ObjectId {
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Repo
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
     pub zstd_level: i32,
+    pub pack_size: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockMode {
-    /// No lock (only for `list`, which reads nothing but manifests).
+    /// No lock and no pack index (only for `list`, which reads nothing but manifests).
     None,
     /// Reading objects (restore, verify). Many can run at once.
     Shared,
@@ -98,31 +110,70 @@ pub struct Put {
     pub stored: Option<u64>,
 }
 
+/// A pack as listed in the in-memory index.
+#[derive(Clone, Debug)]
+pub struct PackInfo {
+    pub id: ObjectId,
+    /// File size on disk.
+    pub size: u64,
+    pub entries: Vec<Entry>,
+}
+
+#[derive(Clone, Copy)]
+struct Loc {
+    pack: ObjectId,
+    offset: u64,
+    len: u32,
+}
+
+#[derive(Default)]
+struct Index {
+    packs: HashMap<ObjectId, PackInfo>,
+    objects: HashMap<ObjectId, Loc>,
+}
+
+impl Index {
+    fn add(&mut self, info: PackInfo) {
+        for e in &info.entries {
+            // A crash during repack can leave an object in two packs; either copy is fine.
+            self.objects.insert(e.id, Loc { pack: info.id, offset: e.offset, len: e.len });
+        }
+        self.packs.insert(info.id, info);
+    }
+}
+
 pub struct Repo {
     root: PathBuf,
     pub config: Config,
-    /// Objects known to exist (or claimed by a thread that's writing them) —
-    /// saves a filesystem lookup per chunk and stops two threads storing the same chunk.
+    index: RwLock<Index>,
+    /// Ids stored (or being stored) by this process but maybe not in a written pack yet.
     known: Mutex<HashSet<ObjectId>>,
+    /// The pack currently being filled.
+    open_pack: Mutex<Builder>,
+    /// Open file handles, so restoring 100k chunks doesn't mean 100k `open()` calls.
+    handles: Mutex<HashMap<ObjectId, Arc<File>>>,
+    /// Problems found while loading (e.g. an unreadable pack).
+    pub warnings: Vec<String>,
     _lock: Option<File>,
 }
 
 impl Repo {
     /// Create a new, empty repository at `path` (must not exist or be empty).
-    pub fn init(path: &Path, zstd_level: i32) -> Result<()> {
+    pub fn init(path: &Path, zstd_level: i32, pack_size: u64) -> Result<()> {
         if !(1..=22).contains(&zstd_level) {
             bail!("zstd level must be between 1 and 22");
+        }
+        if !(64 << 10..=1 << 30).contains(&pack_size) {
+            bail!("pack size must be between 64 KiB and 1 GiB");
         }
         if path.exists() && fs::read_dir(path)?.next().is_some() {
             bail!("{} already exists and is not empty", path.display());
         }
-        for i in 0..=255u8 {
-            fs::create_dir_all(path.join("objects").join(format!("{i:02x}")))?;
+        for d in ["packs", "snapshots", "tmp"] {
+            fs::create_dir_all(path.join(d))?;
         }
-        fs::create_dir_all(path.join("snapshots"))?;
-        fs::create_dir_all(path.join("tmp"))?;
         File::create(path.join("lock"))?;
-        let config = Config { version: FORMAT_VERSION, zstd_level };
+        let config = Config { version: REPO_VERSION, zstd_level, pack_size };
         atomic_write(&path.join("config.json"), &path.join("tmp"), &serde_json::to_vec_pretty(&config)?)?;
         sync_dir(path)?;
         Ok(())
@@ -132,13 +183,21 @@ impl Repo {
         let cfg_path = path.join("config.json");
         let raw = fs::read(&cfg_path)
             .with_context(|| format!("{} is not a vxl repository (run `vxl init` first)", path.display()))?;
-        let config: Config = serde_json::from_slice(&raw).context("reading config.json")?;
-        if config.version > FORMAT_VERSION {
+        let version = serde_json::from_slice::<serde_json::Value>(&raw)
+            .context("reading config.json")?
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if version > REPO_VERSION as u64 {
+            bail!("repository format v{version} is newer than this vxl (v{REPO_VERSION}); upgrade vxl");
+        }
+        if version < REPO_VERSION as u64 {
             bail!(
-                "repository format v{} is newer than this vxl (v{FORMAT_VERSION}); upgrade vxl",
-                config.version
+                "repository format v{version} is from an early development build of vxl and \
+                 can't be read any more; create a new repository with `vxl init`"
             );
         }
+        let config: Config = serde_json::from_slice(&raw).context("reading config.json")?;
         let lock_file = match lock {
             LockMode::None => None,
             mode => {
@@ -153,7 +212,41 @@ impl Repo {
                 }
             }
         };
-        Ok(Repo { root: path.to_path_buf(), config, known: Mutex::default(), _lock: lock_file })
+        let mut repo = Repo {
+            root: path.to_path_buf(),
+            config,
+            index: RwLock::default(),
+            known: Mutex::default(),
+            open_pack: Mutex::default(),
+            handles: Mutex::default(),
+            warnings: Vec::new(),
+            _lock: lock_file,
+        };
+        if lock != LockMode::None {
+            repo.load_index()?;
+        }
+        Ok(repo)
+    }
+
+    fn load_index(&mut self) -> Result<()> {
+        let mut index = Index::default();
+        for e in fs::read_dir(self.root.join("packs"))? {
+            let path = e?.path();
+            let Some(id) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".pack"))
+                .and_then(|h| ObjectId::from_hex(h).ok())
+            else {
+                continue;
+            };
+            match pack::read_index(&path) {
+                Ok((size, entries)) => index.add(PackInfo { id, size, entries }),
+                Err(e) => self.warnings.push(format!("ignoring unreadable pack {}: {e:#}", path.display())),
+            }
+        }
+        self.index = RwLock::new(index);
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -164,77 +257,149 @@ impl Repo {
         self.root.join("tmp")
     }
 
-    fn object_path(&self, id: &ObjectId) -> PathBuf {
-        let hex = id.hex();
-        self.root.join("objects").join(&hex[..2]).join(&hex[2..])
+    fn pack_path(&self, id: &ObjectId) -> PathBuf {
+        self.root.join("packs").join(format!("{}.pack", id.hex()))
     }
 
-    // -- objects -------------------------------------------------------------
+    // -- writing ---------------------------------------------------------------
 
-    /// Store `data` unless an identical object already exists.
+    /// Store `data` unless an identical object already exists. The object goes
+    /// into the open pack; call [`Repo::flush`] before relying on it being on disk.
     pub fn put(&self, data: &[u8]) -> Result<Put> {
         let id = ObjectId::of(data);
-        if self.known.lock().unwrap().contains(&id) {
+        if self.index.read().unwrap().objects.contains_key(&id) {
             return Ok(Put { id, stored: None });
         }
-        // (filesystem check outside the mutex so threads don't queue up on it)
-        let on_disk = self.object_path(&id).exists();
-        // `insert` returns false if another thread claimed this id in the meantime.
-        if !self.known.lock().unwrap().insert(id) || on_disk {
+        // `insert` returns false if this id was already stored (or claimed by another thread).
+        if !self.known.lock().unwrap().insert(id) {
             return Ok(Put { id, stored: None });
         }
         let packed = zstd::bulk::compress(data, self.config.zstd_level)?;
-        let res = atomic_write(&self.object_path(&id), &self.tmp_dir(), &packed);
-        if res.is_err() {
-            self.known.lock().unwrap().remove(&id);
+        let full = {
+            let mut open = self.open_pack.lock().unwrap();
+            open.add(id, &packed)?;
+            (open.data_len() >= self.config.pack_size).then(|| std::mem::take(&mut *open))
+        };
+        // Write a full pack outside the lock so other threads keep filling a new one.
+        if let Some(b) = full {
+            self.write_pack(b)?;
         }
-        res.with_context(|| format!("storing object {id}"))?;
         Ok(Put { id, stored: Some(packed.len() as u64) })
+    }
+
+    fn write_pack(&self, b: Builder) -> Result<ObjectId> {
+        let done = b.finish();
+        atomic_write(&self.pack_path(&done.id), &self.tmp_dir(), &done.bytes)
+            .with_context(|| format!("writing pack {}", done.id))?;
+        let info = PackInfo { id: done.id, size: done.bytes.len() as u64, entries: done.entries };
+        self.index.write().unwrap().add(info);
+        Ok(done.id)
+    }
+
+    /// Write the partly filled pack and make all new packs durable.
+    pub fn flush(&self) -> Result<()> {
+        let b = std::mem::take(&mut *self.open_pack.lock().unwrap());
+        if !b.is_empty() {
+            self.write_pack(b)?;
+        }
+        sync_dir(&self.root.join("packs"))
+    }
+
+    // -- reading ---------------------------------------------------------------
+
+    fn handle(&self, pack: &ObjectId) -> Result<Arc<File>> {
+        if let Some(f) = self.handles.lock().unwrap().get(pack) {
+            return Ok(f.clone());
+        }
+        let f =
+            Arc::new(File::open(self.pack_path(pack)).with_context(|| format!("pack {pack} is missing"))?);
+        self.handles.lock().unwrap().insert(*pack, f.clone());
+        Ok(f)
+    }
+
+    /// The compressed bytes of an object, unverified.
+    pub fn read_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        let loc =
+            *self.index.read().unwrap().objects.get(id).ok_or_else(|| anyhow!("object {id} is missing"))?;
+        let mut buf = vec![0u8; loc.len as usize];
+        pack::read_at(&*self.handle(&loc.pack)?, &mut buf, loc.offset)
+            .with_context(|| format!("reading object {id} from pack {}", loc.pack))?;
+        Ok(buf)
     }
 
     /// Load and verify an object.
     pub fn get(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        let path = self.object_path(id);
-        let packed = fs::read(&path).with_context(|| format!("object {id} is missing"))?;
-        let data = zstd::stream::decode_all(packed.as_slice())
-            .with_context(|| format!("object {id} is corrupt (bad zstd data)"))?;
-        if ObjectId::of(&data) != *id {
-            bail!("object {id} is corrupt (hash mismatch)");
-        }
-        Ok(data)
+        decode_verified(id, &self.read_raw(id)?)
     }
 
-    pub fn has(&self, id: &ObjectId) -> bool {
-        self.object_path(id).exists()
+    /// All objects with their compressed size.
+    pub fn list_objects(&self) -> Vec<(ObjectId, u64)> {
+        let index = self.index.read().unwrap();
+        index.objects.iter().map(|(id, loc)| (*id, loc.len as u64)).collect()
     }
 
-    /// All objects with their on-disk (compressed) size.
-    pub fn list_objects(&self) -> Result<Vec<(ObjectId, u64)>> {
-        let mut out = Vec::new();
-        for i in 0..=255u8 {
-            let prefix = format!("{i:02x}");
-            let dir = self.root.join("objects").join(&prefix);
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
-            for e in entries {
-                let e = e?;
-                let name = e.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if let Ok(id) = ObjectId::from_hex(&format!("{prefix}{name}")) {
-                    out.push((id, e.metadata()?.len()));
+    pub fn packs(&self) -> Vec<PackInfo> {
+        let mut packs: Vec<_> = self.index.read().unwrap().packs.values().cloned().collect();
+        packs.sort_by_key(|p| p.id);
+        packs
+    }
+
+    /// Where an object lives on disk: (pack file, offset). For tests and debugging.
+    #[doc(hidden)]
+    pub fn locate(&self, id: &ObjectId) -> Option<(PathBuf, u64)> {
+        let loc = *self.index.read().unwrap().objects.get(id)?;
+        Some((self.pack_path(&loc.pack), loc.offset))
+    }
+
+    // -- garbage collection ------------------------------------------------------
+
+    /// Copy the `keep` objects out of `packs` into new packs (verifying each
+    /// one), make those durable, then delete the old packs. Needs the exclusive lock.
+    /// Returns (new packs written, their total size).
+    pub fn repack(&self, packs: &[PackInfo], keep: &HashSet<ObjectId>) -> Result<(u64, u64)> {
+        let mut copied = HashSet::new();
+        let mut b = Builder::default();
+        let mut written = Vec::new();
+        for p in packs {
+            let f = self.handle(&p.id)?;
+            for e in &p.entries {
+                if !keep.contains(&e.id) || !copied.insert(e.id) {
+                    continue;
+                }
+                let mut raw = vec![0u8; e.len as usize];
+                pack::read_at(&f, &mut raw, e.offset)?;
+                decode_verified(&e.id, &raw).context("refusing to repack a damaged object")?;
+                b.add(e.id, &raw)?;
+                if b.data_len() >= self.config.pack_size {
+                    written.push(self.write_pack(std::mem::take(&mut b))?);
                 }
             }
         }
-        Ok(out)
+        if !b.is_empty() {
+            written.push(self.write_pack(b)?);
+        }
+        // New copies must be durable before the old ones go away.
+        sync_dir(&self.root.join("packs"))?;
+        for p in packs {
+            if !written.contains(&p.id) {
+                self.delete_pack(&p.id)?;
+            }
+        }
+        let index = self.index.read().unwrap();
+        let bytes = written.iter().filter_map(|id| index.packs.get(id)).map(|p| p.size).sum();
+        Ok((written.len() as u64, bytes))
     }
 
-    pub fn delete_object(&self, id: &ObjectId) -> Result<()> {
-        fs::remove_file(self.object_path(id)).with_context(|| format!("deleting object {id}"))
-    }
-
-    /// Make renames of new objects durable (call before committing a snapshot).
-    pub fn sync_objects(&self) -> Result<()> {
-        for i in 0..=255u8 {
-            sync_dir(&self.root.join("objects").join(format!("{i:02x}")))?;
+    pub fn delete_pack(&self, id: &ObjectId) -> Result<()> {
+        self.handles.lock().unwrap().remove(id);
+        fs::remove_file(self.pack_path(id)).with_context(|| format!("deleting pack {id}"))?;
+        let mut index = self.index.write().unwrap();
+        if let Some(info) = index.packs.remove(id) {
+            for e in info.entries {
+                if index.objects.get(&e.id).is_some_and(|l| l.pack == *id) {
+                    index.objects.remove(&e.id);
+                }
+            }
         }
         Ok(())
     }
@@ -320,6 +485,15 @@ impl Repo {
     }
 }
 
+fn decode_verified(id: &ObjectId, packed: &[u8]) -> Result<Vec<u8>> {
+    let data = zstd::stream::decode_all(packed)
+        .with_context(|| format!("object {id} is corrupt (bad zstd data)"))?;
+    if ObjectId::of(&data) != *id {
+        bail!("object {id} is corrupt (hash mismatch)");
+    }
+    Ok(data)
+}
+
 /// Shortest prefix length (min 6) that keeps every id in `ids` unique.
 pub fn short_len(ids: &[ObjectId]) -> usize {
     let mut hexes: Vec<String> = ids.iter().map(|i| i.hex()).collect();
@@ -336,50 +510,135 @@ pub fn short_len(ids: &[ObjectId]) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn put_get_dedup() {
+    const SMALL: u64 = 64 << 10;
+
+    fn fresh(pack_size: u64) -> (tempfile::TempDir, Repo) {
         let dir = tempfile::tempdir().unwrap();
-        Repo::init(dir.path(), 3).unwrap();
+        Repo::init(dir.path(), 3, pack_size).unwrap();
         let repo = Repo::open(dir.path(), LockMode::Exclusive).unwrap();
+        (dir, repo)
+    }
+
+    fn noise(seed: u64, n: usize) -> Vec<u8> {
+        let mut x = seed * 2 + 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn put_get_dedup_across_reopen() {
+        let (dir, repo) = fresh(DEFAULT_PACK_SIZE);
         let a = repo.put(b"chunk data").unwrap();
         assert!(a.stored.is_some());
         let b = repo.put(b"chunk data").unwrap();
         assert_eq!(a.id, b.id);
         assert!(b.stored.is_none());
+        repo.flush().unwrap();
         assert_eq!(repo.get(&a.id).unwrap(), b"chunk data");
-        assert_eq!(repo.list_objects().unwrap().len(), 1);
+        assert_eq!(repo.packs().len(), 1);
 
-        // a fresh handle (empty cache) still dedups via the filesystem
         drop(repo);
         let repo = Repo::open(dir.path(), LockMode::Exclusive).unwrap();
+        assert!(repo.warnings.is_empty());
         assert!(repo.put(b"chunk data").unwrap().stored.is_none());
+        assert_eq!(repo.get(&a.id).unwrap(), b"chunk data");
+    }
+
+    #[test]
+    fn unflushed_objects_are_not_on_disk() {
+        let (dir, repo) = fresh(DEFAULT_PACK_SIZE);
+        repo.put(b"never flushed").unwrap();
+        drop(repo);
+        let repo = Repo::open(dir.path(), LockMode::Exclusive).unwrap();
+        assert!(repo.list_objects().is_empty());
+    }
+
+    #[test]
+    fn packs_roll_over_at_target_size() {
+        let (_dir, repo) = fresh(SMALL);
+        let ids: Vec<_> = (0..40).map(|i| repo.put(&noise(i, 10_000)).unwrap().id).collect();
+        repo.flush().unwrap();
+        let packs = repo.packs();
+        assert!(packs.len() >= 6, "{} packs", packs.len());
+        assert!(packs.iter().all(|p| p.size < SMALL + 20_000));
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(repo.get(id).unwrap(), noise(i as u64, 10_000));
+        }
     }
 
     #[test]
     fn corruption_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        Repo::init(dir.path(), 3).unwrap();
+        let (_dir, repo) = fresh(DEFAULT_PACK_SIZE);
+        let id = repo.put(&noise(1, 5000)).unwrap().id;
+        repo.flush().unwrap();
+        let (path, offset) = repo.locate(&id).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[offset as usize + 100] ^= 0xFF;
+        fs::write(&path, bytes).unwrap();
+        assert!(repo.get(&id).unwrap_err().to_string().contains("corrupt"));
+    }
+
+    #[test]
+    fn unreadable_pack_is_a_warning() {
+        let (dir, repo) = fresh(DEFAULT_PACK_SIZE);
+        repo.put(b"x").unwrap();
+        repo.flush().unwrap();
+        let path = repo.packs()[0].id;
+        drop(repo);
+        fs::write(dir.path().join("packs").join(format!("{}.pack", path.hex())), b"junk").unwrap();
+        let repo = Repo::open(dir.path(), LockMode::Shared).unwrap();
+        assert_eq!(repo.warnings.len(), 1);
+        assert!(repo.list_objects().is_empty());
+    }
+
+    #[test]
+    fn repack_keeps_only_live_objects() {
+        let (dir, repo) = fresh(SMALL);
+        let ids: Vec<_> = (0..20).map(|i| repo.put(&noise(i, 8_000)).unwrap().id).collect();
+        repo.flush().unwrap();
+        let keep: HashSet<_> = ids.iter().step_by(3).copied().collect();
+        let old = repo.packs();
+        let (written, _) = repo.repack(&old, &keep).unwrap();
+        assert!(written >= 1);
+        assert_eq!(repo.list_objects().len(), keep.len());
+        for p in &old {
+            assert!(!dir.path().join("packs").join(format!("{}.pack", p.id.hex())).exists());
+        }
+        drop(repo);
         let repo = Repo::open(dir.path(), LockMode::Exclusive).unwrap();
-        let id = repo.put(b"original").unwrap().id;
-        let other = zstd::bulk::compress(b"tampered", 3).unwrap();
-        fs::write(repo.object_path(&id), other).unwrap();
-        assert!(repo.get(&id).unwrap_err().to_string().contains("hash mismatch"));
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(repo.get(id).is_ok(), keep.contains(id), "object {i}");
+        }
     }
 
     #[test]
     fn exclusive_lock_blocks_others() {
-        let dir = tempfile::tempdir().unwrap();
-        Repo::init(dir.path(), 3).unwrap();
-        let _w = Repo::open(dir.path(), LockMode::Exclusive).unwrap();
+        let (dir, _w) = fresh(DEFAULT_PACK_SIZE);
         assert!(Repo::open(dir.path(), LockMode::Shared).is_err());
         assert!(Repo::open(dir.path(), LockMode::None).is_ok());
     }
 
     #[test]
-    fn init_refuses_non_empty() {
+    fn init_validates() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("x"), b"").unwrap();
-        assert!(Repo::init(dir.path(), 3).is_err());
+        assert!(Repo::init(dir.path(), 3, DEFAULT_PACK_SIZE).is_err());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(Repo::init(empty.path(), 3, 10).is_err());
+    }
+
+    #[test]
+    fn old_format_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"version":1,"zstd_level":6}"#).unwrap();
+        let err = Repo::open(dir.path(), LockMode::Shared).err().unwrap();
+        assert!(err.to_string().contains("early development build"));
     }
 
     #[test]

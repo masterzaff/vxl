@@ -33,12 +33,12 @@ cargo install --path .
 
 | command | what it does |
 |---|---|
-| `init <path> [--zstd-level N]` | create an empty repository (default level 6, see below) |
+| `init <path> [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: level 6, 16 MiB packs) |
 | `backup <world> [-m msg]` | snapshot a world; only new/changed chunks are stored |
 | `list` | snapshots, newest first, with what each one added |
 | `restore <id> <folder> [--force \| --force-wipe]` | rebuild a snapshot into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
-| `prune [--keep-last N] [--dry-run]` | drop old snapshots and garbage-collect data nothing references |
+| `prune [--keep-last N] [--dry-run]` | drop old snapshots, delete/compact packs holding data nothing references |
 
 Snapshot ids can be shortened to any unique prefix, like git.
 
@@ -76,12 +76,20 @@ save-on
 
 ```
 repo/
-  config.json               format version + zstd level
+  config.json               format version, zstd level, pack size
   lock                      OS file lock: backup/prune are exclusive, restore/verify shared
-  objects/ab/cdef…          zstd(data), named by BLAKE3(data)
+  packs/<id>.pack           ~16 MiB files of zstd-compressed objects, each with its own index
   snapshots/<id>.json.zst   one manifest per snapshot
   tmp/                      staging for atomic writes
 ```
+
+- **Objects** (a chunk's NBT, or a whole file) are named by the BLAKE3 hash of their
+  uncompressed content and stored zstd-compressed inside **pack files**. A pack is written
+  once and never modified: object data, then an index (object id → offset, length) at the
+  end. Its file name is the hash of its contents. On open, vxl reads every pack's index into
+  memory, so finding an object is a hash-map lookup plus one read. A big world ends up
+  as a few hundred files instead of hundreds of thousands, which is much kinder to HDDs,
+  network shares, rsync and cloud sync, and wastes no space to filesystem block slack.
 
 - **Region files** (`r.X.Z.mca` in `region/`, `entities/`, `poi/`, every dimension) are split
   into chunks. Each chunk's NBT is decompressed (gzip, zlib, none or LZ4 — all four
@@ -92,9 +100,9 @@ repo/
   object. `session.lock` is skipped.
 - **The manifest** lists every file, and for region files every chunk's slot, timestamp,
   original compression and object hash. Its own hash is the snapshot id.
-- **Crash safety**: objects are written to `tmp/`, fsynced and renamed into place, and the
-  manifest is written last. A backup that dies halfway leaves no snapshot, only unreferenced
-  objects, which the next `prune` removes.
+- **Crash safety**: packs are built in memory, written to `tmp/`, fsynced and renamed into
+  place; the manifest is written last, after the final pack. A backup that dies halfway
+  leaves no snapshot, only packs nobody references, which the next `prune` removes.
 - **Restore** rebuilds each region file and recompresses each chunk with its original
   compression type. The result is chunk-for-chunk identical to the original, not
   byte-for-byte (sector layout and zlib output may differ); Minecraft doesn't care.
@@ -103,8 +111,13 @@ repo/
   as broken as before, never worse. A region file that isn't valid at all is stored as a
   plain file. A chunk whose header points outside the file (or at a missing `.mcc`) has no
   bytes to keep and is skipped. All of these print a warning.
-- **Prune** deletes manifests first, then objects. If any kept snapshot can't be read,
-  it refuses to delete objects at all.
+- **Prune** deletes the dropped manifests, then works out which objects the remaining
+  snapshots still need. Packs with nothing live are deleted. Packs that are ≥25% garbage,
+  and small leftover packs from incremental backups, are **repacked**: their live objects
+  are verified and copied into new packs, which are made durable *before* the old packs
+  are deleted. Garbage in packs that are still mostly in use stays until a later prune
+  pushes them over the threshold (prune tells you how much). If any kept snapshot can't
+  be read, it refuses to delete anything.
 
 ### Choosing the zstd level
 
@@ -135,9 +148,10 @@ the level matters less over time than it might seem. Run it on your own world to
 
 - Chunks the server has *loaded* get new `LastUpdate`/`InhabitedTime` values in their NBT,
   so they count as changed even when no block moved. Only chunks nobody visited dedupe for free.
-- One file per object: on most filesystems each object also uses up to one block (4 KiB) of
-  slack, so disk usage is a bit above the "stored" figure. Packing objects into larger
-  files would fix that.
+- The pack index is held in memory: roughly 100 bytes per object, so ~100 MB for a
+  million distinct chunks across all snapshots.
+- Repositories made by the first development build (loose object files, format v1)
+  can't be opened; create a new one.
 - `list` reads every manifest; fine up to hundreds of snapshots.
 
 ## Code map (for reading the source)
@@ -146,7 +160,8 @@ the level matters less over time than it might seem. Run it on your own world to
 |---|---|
 | `src/main.rs` | CLI (clap) and output formatting only |
 | `src/anvil.rs` | region file parsing/writing, chunk (de)compression incl. Minecraft's LZ4 framing |
-| `src/repo.rs` | repository, locking, object store (`put`/`get`), snapshot storage |
+| `src/repo.rs` | repository, locking, object store (`put`/`get`/`repack`), snapshot storage |
+| `src/pack.rs` | the pack file format (pure: bytes in, bytes out) |
 | `src/manifest.rs` | the snapshot data structures (serde) |
 | `src/world.rs` | walks a world folder and classifies files |
 | `src/commands/*.rs` | one file per subcommand, each returns a report struct |

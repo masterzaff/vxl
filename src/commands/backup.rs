@@ -84,9 +84,7 @@ pub fn backup(
 
     // Objects first, durably; then the manifest. A crash before this point leaves
     // only unreferenced objects, which `prune` cleans up.
-    if stats.new_objects > 0 {
-        repo.sync_objects()?;
-    }
+    repo.flush()?;
     let snap = Snapshot {
         header: SnapshotHeader {
             version: FORMAT_VERSION,

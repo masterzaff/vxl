@@ -34,6 +34,9 @@ enum Cmd {
         /// zstd level for stored chunks (1–22). Higher = smaller but slower backups.
         #[arg(long, default_value_t = repo::DEFAULT_ZSTD_LEVEL)]
         zstd_level: i32,
+        /// Target size of pack files, in MiB.
+        #[arg(long, default_value_t = repo::DEFAULT_PACK_SIZE >> 20)]
+        pack_size_mb: u64,
     },
     /// Snapshot a world. Only new or changed chunks are stored.
     Backup {
@@ -122,13 +125,15 @@ fn print_warnings(warnings: &[String]) {
 }
 
 fn open(r: &RepoArg, lock: LockMode) -> Result<Repo> {
-    Repo::open(&r.repo, lock)
+    let repo = Repo::open(&r.repo, lock)?;
+    print_warnings(&repo.warnings);
+    Ok(repo)
 }
 
 fn run(cli: Cli) -> Result<ExitCode> {
     match cli.cmd {
-        Cmd::Init { path, zstd_level } => {
-            Repo::init(&path, zstd_level)?;
+        Cmd::Init { path, zstd_level, pack_size_mb } => {
+            Repo::init(&path, zstd_level, pack_size_mb << 20)?;
             println!("initialized empty vxl repository in {}", path.display());
         }
 
@@ -215,14 +220,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{verb} snapshot {}", short(id, 6));
             }
             println!(
-                "{verb} {} snapshots, kept {} | {} {} objects, {} {}",
+                "{verb} {} snapshots, kept {} | {} {} objects | {} {} packs, {} {} | {} {}",
                 r.removed_snapshots.len(),
                 r.kept_snapshots,
                 if dry_run { "would delete" } else { "deleted" },
                 thousands(r.deleted_objects),
+                if dry_run { "would drop" } else { "dropped" },
+                r.packs_deleted,
+                if dry_run { "would repack" } else { "repacked" },
+                r.packs_repacked,
                 if dry_run { "would free" } else { "freed" },
                 human_bytes(r.freed_bytes),
             );
+            if r.garbage_left > 0 {
+                println!(
+                    "({} unused objects stay in packs that are mostly still in use)",
+                    thousands(r.garbage_left)
+                );
+            }
         }
 
         Cmd::Verify { snapshot, repo } => {

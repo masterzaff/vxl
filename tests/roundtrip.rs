@@ -62,7 +62,7 @@ fn setup() -> Env {
     let base = tmp.path().to_path_buf();
     let world = base.join("world");
     let repo_dir = base.join("repo");
-    Repo::init(&repo_dir, 3).unwrap();
+    Repo::init(&repo_dir, 3, TEST_PACK_SIZE).unwrap();
     Env { _tmp: tmp, world, repo_dir, base }
 }
 
@@ -85,6 +85,16 @@ fn do_restore(env: &Env, id: &ObjectId, name: &str) -> std::path::PathBuf {
 }
 
 const REGIONS: &[(i32, i32)] = &[(0, 0), (-1, 0)];
+/// Small packs so tests exercise pack rollover and repacking.
+const TEST_PACK_SIZE: u64 = 256 << 10;
+
+/// Flip one byte inside an object's compressed data, in its pack file.
+fn damage(env: &Env, id: &ObjectId) {
+    let (path, offset) = repo(env).locate(id).unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[offset as usize + 20] ^= 0xFF;
+    fs::write(&path, bytes).unwrap();
+}
 
 #[test]
 fn backup_is_incremental_and_restore_is_lossless() {
@@ -205,15 +215,21 @@ fn prune_keeps_what_is_needed() {
         synth::write_world(&env.world, 4, &[(0, 0)], 50, Compression::Zlib, edit).unwrap();
         ids.push(do_backup(&env, &format!("round {round}")).id);
     }
-    let objects_before = repo(&env).list_objects().unwrap().len();
+    let objects_before = repo(&env).list_objects().len();
 
     let dry = prune::prune(&repo(&env), Some(2), true).unwrap();
     assert_eq!(dry.removed_snapshots.len(), 2);
-    assert_eq!(repo(&env).list_objects().unwrap().len(), objects_before);
+    assert_eq!(repo(&env).list_objects().len(), objects_before);
 
+    let packs_before = repo(&env).packs();
+    let disk_before: u64 = packs_before.iter().map(|p| p.size).sum();
     let r = prune::prune(&repo(&env), Some(2), false).unwrap();
     assert_eq!(r.removed_snapshots, dry.removed_snapshots);
     assert!(r.deleted_objects > 0 && r.freed_bytes > 0);
+    assert!(r.packs_repacked + r.packs_deleted > 0, "{r:?}");
+    let disk_after: u64 = repo(&env).packs().iter().map(|p| p.size).sum();
+    assert_eq!(disk_before - disk_after, r.freed_bytes);
+    assert_eq!(repo(&env).list_objects().len() as u64, objects_before as u64 - r.deleted_objects);
     assert_eq!(repo(&env).snapshot_ids().unwrap().len(), 2);
 
     // Newest two still verify and restore; the old ones are gone.
@@ -227,6 +243,7 @@ fn prune_keeps_what_is_needed() {
     // A second prune finds nothing.
     let again = prune::prune(&repo(&env), Some(2), false).unwrap();
     assert_eq!(again.deleted_objects, 0);
+    assert_eq!(again.packs_deleted, 0);
 }
 
 #[test]
@@ -241,10 +258,8 @@ fn verify_catches_damage_and_restore_refuses_non_empty_target() {
     assert!(restore::restore(&repo(&env), &id, &busy, restore::Mode::Fresh, &hidden()).is_err());
     assert_eq!(fs::read(busy.join("keep.txt")).unwrap(), b"mine");
 
-    let (victim, _) = repo(&env).list_objects().unwrap()[0];
-    let hex = victim.hex();
-    let path = env.repo_dir.join("objects").join(&hex[..2]).join(&hex[2..]);
-    fs::write(&path, zstd::bulk::compress(b"bitrot", 3).unwrap()).unwrap();
+    let (victim, _) = repo(&env).list_objects().into_iter().max_by_key(|o| o.1).unwrap();
+    damage(&env, &victim);
     let v = verify::verify(&repo(&env), &[id], &hidden()).unwrap();
     assert_eq!(v.problems.len(), 1);
     assert_eq!(v.problems[0].0, victim);
@@ -256,7 +271,7 @@ fn refuses_repo_inside_world() {
     let world = tmp.path().join("world");
     synth::write_world(&world, 6, &[], 0, Compression::Zlib, |_, _| 0).unwrap();
     let repo_dir = world.join("backups");
-    Repo::init(&repo_dir, 3).unwrap();
+    Repo::init(&repo_dir, 3, TEST_PACK_SIZE).unwrap();
     let repo = Repo::open(&repo_dir, LockMode::Exclusive).unwrap();
     let err = backup::backup(&repo, &world, None, &hidden()).err().unwrap();
     assert!(err.to_string().contains("inside the world"));
@@ -358,9 +373,8 @@ fn force_refuses_non_worlds_and_failed_restores_change_nothing() {
     // must be exactly as it was (and no staging folder left behind).
     diverge(&env);
     let before = contents(&env.world);
-    let victim = repo(&env).list_objects().unwrap()[0].0.hex();
-    let path = env.repo_dir.join("objects").join(&victim[..2]).join(&victim[2..]);
-    fs::write(&path, b"garbage").unwrap();
+    let (victim, _) = repo(&env).list_objects().into_iter().max_by_key(|o| o.1).unwrap();
+    damage(&env, &victim);
     let err = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Wipe, &hidden()).err().unwrap();
     assert!(format!("{err:#}").contains("was not changed"), "{err:#}");
     assert_eq!(contents(&env.world), before);
@@ -384,4 +398,28 @@ fn assert_no_staging(dir: &Path) {
         .filter(|n| n.starts_with(".vxl-staging"))
         .collect();
     assert!(left.is_empty(), "staging left behind: {left:?}");
+}
+
+#[test]
+fn packs_from_a_crashed_backup_are_collected() {
+    let env = setup();
+    synth::write_world(&env.world, 9, &[(0, 0)], 30, Compression::Zlib, |_, _| 0).unwrap();
+    let id = do_backup(&env, "good").id;
+    let good_packs = repo(&env).packs().len();
+
+    // A backup that wrote packs and then died before its manifest.
+    {
+        let r = repo(&env);
+        for i in 0..50u32 {
+            r.put(&synth::chunk_nbt(9, 100 + i as i32, 0, 1)).unwrap();
+        }
+        r.flush().unwrap();
+    }
+    assert!(repo(&env).packs().len() > good_packs);
+
+    let p = prune::prune(&repo(&env), None, false).unwrap();
+    assert_eq!(p.deleted_objects, 50);
+    assert_eq!(repo(&env).packs().len(), good_packs);
+    let v = verify::verify(&repo(&env), &[id], &hidden()).unwrap();
+    assert!(v.problems.is_empty());
 }
