@@ -167,11 +167,17 @@ Steps:
 5. ✅ **`vxl migrate`** v2 → v3: adds a group copy of every chunk, checks every one, then
    drops the old copies. Interruptible and resumable; snapshot ids unchanged. 31 s for the
    7-copy repo, ending the same size as a native format-3 repo.
-6. Make format 3 the default after it has run on a real server for a while.
-7. **Manifests.** Each snapshot's manifest lists every chunk (~5 MB for 117k chunks), now
-   about half of a format-3 night. Next: store a region's chunk list as its own object, so
-   unchanged regions cost nothing.
-8. Measure unpack (~−5%) and a trained dictionary (~−10%) on top of format 3; optionally
+6. ✅ **Format 3 is the default** (`vxl init --format 2` for the old one), with a way back:
+   `vxl migrate --to 2` gives every chunk a plain copy, checks them, inlines chunk lists
+   (those snapshots get new ids), drops group objects, and only then marks the repo
+   format 2. Real copies: back to exactly the format-2 size, verified, restored identical.
+7. ✅ **Chunk tables.** Each region file's chunk list is its own object (manifest format 3),
+   so unchanged regions cost nothing. Measured first (`examples/manifest_bench.rs`): one
+   table per region beat pieces of 256/64/32 slots on quiet nights and was within ~0.2 MB
+   on busy ones. A night's chunk list went from 4.9 MB to 0.4–1.9 MB, and an idle night
+   from 5 MB to 20 KB. Totals: changed nights 18–54% of format 2, 7 copies 75%.
+8. Real-server use of format 3 (nightly + prune for a few weeks).
+9. Measure unpack (~−5%) and a trained dictionary (~−10%) on top of format 3; optionally
    recompress at a higher zstd level during prune.
 
 ## Phase 4: robustness and operations

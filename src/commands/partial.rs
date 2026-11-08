@@ -171,7 +171,7 @@ pub fn restore_partial(
         for f in &w.files {
             let Some(coords) = sel.region(f.path()) else { continue };
             match f {
-                FileEntry::Region { path, chunks } => {
+                FileEntry::Region { path, chunks, .. } => {
                     regions.insert(path.clone(), (coords, Some(chunks.clone())));
                 }
                 FileEntry::Blob { path, .. } => report.warnings.push(format!(

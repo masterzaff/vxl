@@ -5,17 +5,22 @@
 //!
 //! Version 1 had a single world's file list at the top level; it is read as a
 //! snapshot with one world named after its source folder (see [`Snapshot::upgrade`]).
+//! Version 3 (repository format 3) may store a region file's chunk list as its own
+//! object, a *table* (see [`encode_table`]): a region whose chunks didn't change gives the
+//! same table, so it isn't stored again. [`crate::repo::Repo::load_snapshot`] fills the
+//! chunk lists back in, so code using a loaded snapshot never sees the difference.
 
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::repo::ObjectId;
 
 /// 2: a snapshot holds several worlds (`worlds`), each with its own file list.
-pub const FORMAT_VERSION: u32 = 2;
+/// 3: region chunk lists may be stored as table objects.
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stats {
@@ -104,8 +109,14 @@ pub struct World {
 pub enum FileEntry {
     /// A file stored whole (level.dat, playerdata/…, broken region files).
     Blob { path: String, size: u64, hash: ObjectId },
-    /// A region file stored chunk by chunk.
-    Region { path: String, chunks: Vec<ChunkEntry> },
+    /// A region file stored chunk by chunk. With `table`, `chunks` is stored in that
+    /// object rather than in the manifest (and is empty in the stored JSON).
+    Region {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<ObjectId>,
+        chunks: Vec<ChunkEntry>,
+    },
 }
 
 impl FileEntry {
@@ -119,7 +130,7 @@ impl FileEntry {
     pub fn objects(&self) -> impl Iterator<Item = ObjectId> + '_ {
         let (blob, chunks) = match self {
             FileEntry::Blob { hash, .. } => (Some(*hash), &[][..]),
-            FileEntry::Region { chunks, .. } => (None, chunks.as_slice()),
+            FileEntry::Region { table, chunks, .. } => (*table, chunks.as_slice()),
         };
         blob.into_iter().chain(chunks.iter().map(|c| c.hash))
     }
@@ -166,6 +177,48 @@ impl Snapshot {
     }
 }
 
+const TABLE_MAGIC: &[u8; 4] = b"VXT\x01";
+const TABLE_ENTRY: usize = 2 + 4 + 1 + 1 + 32;
+
+/// A region's chunk list as stored in a table object:
+/// `"VXT\x01" | count:u32 | count × (slot:u16 ts:u32 comp:u8 flags:u8 hash[32])` (little-endian;
+/// flag 1 = verbatim).
+pub fn encode_table(chunks: &[ChunkEntry]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + chunks.len() * TABLE_ENTRY);
+    b.extend_from_slice(TABLE_MAGIC);
+    b.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for c in chunks {
+        b.extend_from_slice(&c.slot.to_le_bytes());
+        b.extend_from_slice(&c.ts.to_le_bytes());
+        b.push(c.comp);
+        b.push(c.verbatim as u8);
+        b.extend_from_slice(&c.hash.0);
+    }
+    b
+}
+
+pub fn decode_table(b: &[u8]) -> Result<Vec<ChunkEntry>> {
+    let rest = b.strip_prefix(TABLE_MAGIC).ok_or_else(|| anyhow::anyhow!("not a chunk table"))?;
+    ensure!(rest.len() >= 4, "truncated chunk table");
+    let n = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+    let rest = &rest[4..];
+    ensure!(n.checked_mul(TABLE_ENTRY) == Some(rest.len()), "chunk table has the wrong length");
+    rest.as_chunks::<TABLE_ENTRY>()
+        .0
+        .iter()
+        .map(|e| {
+            ensure!(e[7] <= 1, "bad chunk table flags");
+            Ok(ChunkEntry {
+                slot: u16::from_le_bytes([e[0], e[1]]),
+                ts: u32::from_le_bytes(e[2..6].try_into().unwrap()),
+                comp: e[6],
+                verbatim: e[7] == 1,
+                hash: ObjectId(e[8..].try_into().unwrap()),
+            })
+        })
+        .collect()
+}
+
 /// Turn a manifest path (`region/r.0.0.mca`) into a relative `PathBuf`,
 /// refusing anything that could escape the restore folder.
 pub fn safe_rel_path(p: &str) -> Result<PathBuf> {
@@ -198,6 +251,27 @@ mod tests {
         assert!(!is_valid_world_name(""));
         assert_eq!(v1_world_name("/srv/mc/survival"), "survival");
         assert_eq!(v1_world_name("/"), "world");
+    }
+
+    #[test]
+    fn tables_roundtrip_and_refuse_damage() {
+        let chunks: Vec<ChunkEntry> = (0..5u16)
+            .map(|i| ChunkEntry {
+                slot: i * 100,
+                ts: 1_700_000_000 + i as u32,
+                comp: 2,
+                hash: ObjectId::of(&[i as u8]),
+                verbatim: i == 3,
+            })
+            .collect();
+        let t = encode_table(&chunks);
+        assert_eq!(decode_table(&t).unwrap(), chunks);
+        assert_eq!(decode_table(&encode_table(&[])).unwrap(), []);
+        assert!(decode_table(&t[..t.len() - 1]).is_err());
+        assert!(decode_table(b"VXT\x01\xff\xff\xff\xff").is_err());
+        let mut bad = t.clone();
+        bad[8 + 7] = 2;
+        assert!(decode_table(&bad).is_err());
     }
 
     #[test]

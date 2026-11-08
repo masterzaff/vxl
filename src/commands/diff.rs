@@ -168,6 +168,7 @@ mod tests {
     fn region(path: &str, chunks: &[(u16, u8)]) -> FileEntry {
         FileEntry::Region {
             path: path.into(),
+            table: None,
             chunks: chunks
                 .iter()
                 .map(|&(slot, n)| ChunkEntry { slot, ts: n as u32, comp: 2, hash: h(n), verbatim: false })

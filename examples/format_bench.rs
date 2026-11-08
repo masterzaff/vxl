@@ -119,7 +119,8 @@ fn main() {
     let t = Instant::now();
     let target = work.join("restored");
     let v3 = Repo::open(&repos[1], LockMode::Shared).unwrap();
-    restore::restore(&v3, ids.last().unwrap(), &target, None, restore::Mode::Fresh, &hidden).unwrap();
+    let ids_v3_last = ids.last().unwrap();
+    restore::restore(&v3, ids_v3_last, &target, None, restore::Mode::Fresh, &hidden).unwrap();
     let restore_secs = t.elapsed().as_secs_f64();
     let cmp = compare::compare(days.last().unwrap(), &target).unwrap();
     println!(
@@ -137,8 +138,9 @@ fn main() {
     for (r, v) in repos.iter().zip([2, 3]) {
         let repo = Repo::open(r, LockMode::Shared).unwrap();
         let t = Instant::now();
-        let ids = repo.snapshot_ids().unwrap();
-        let rep = verify::verify(&repo, &ids, &hidden).unwrap();
+        let all = repo.snapshot_ids().unwrap();
+        let ids = &all;
+        let rep = verify::verify(&repo, ids, &hidden).unwrap();
         println!(
             "verify v{v}: {} objects, {} problems, {:.1}s",
             rep.objects,
@@ -151,7 +153,7 @@ fn main() {
     let m = work.join("v2-migrated");
     copy_tree(&repos[0], &m);
     let t = Instant::now();
-    let rep = migrate::migrate(&mut Repo::open(&m, LockMode::Exclusive).unwrap(), &hidden).unwrap();
+    let rep = migrate::migrate(&mut Repo::open(&m, LockMode::Exclusive).unwrap(), 3, &hidden).unwrap();
     println!(
         "migrate v2 copy: {} chunks, {} converted, {} → {} in {:.1}s (on disk now {})",
         rep.chunks,
@@ -165,4 +167,30 @@ fn main() {
     let ids = repo.snapshot_ids().unwrap();
     let v = verify::verify(&repo, &ids, &hidden).unwrap();
     println!("verify migrated: {} objects, {} problems", v.objects, v.problems.len());
+    drop(repo);
+    fs::remove_dir_all(&m).unwrap();
+
+    // And back: a copy of the format-3 repo to format 2.
+    let back = work.join("v3-to-v2");
+    copy_tree(&repos[1], &back);
+    let t = Instant::now();
+    let rep = migrate::migrate(&mut Repo::open(&back, LockMode::Exclusive).unwrap(), 2, &hidden).unwrap();
+    println!(
+        "migrate v3 copy to 2: {} chunks, {} given plain copies, {} → {} in {:.1}s, {} snapshots renamed",
+        rep.chunks,
+        rep.converted,
+        human_bytes(rep.bytes_before),
+        human_bytes(rep.bytes_after),
+        t.elapsed().as_secs_f64(),
+        rep.renamed.len()
+    );
+    let repo = Repo::open(&back, LockMode::Shared).unwrap();
+    let ids = repo.snapshot_ids().unwrap();
+    let v = verify::verify(&repo, &ids, &hidden).unwrap();
+    println!("verify back in format 2: {} objects, {} problems", v.objects, v.problems.len());
+    let newest = rep.renamed.iter().find(|(a, _)| a == ids_v3_last).map(|(_, b)| *b).unwrap();
+    restore::restore(&repo, &newest, &target, None, restore::Mode::Fresh, &hidden).unwrap();
+    let cmp = compare::compare(days.last().unwrap(), &target).unwrap();
+    println!("restore newest from it: {} of {} chunks identical", cmp.same_chunks, cmp.chunks);
+    fs::remove_dir_all(&target).unwrap();
 }

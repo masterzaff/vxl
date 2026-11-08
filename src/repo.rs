@@ -42,7 +42,7 @@ pub const LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// group objects (`group.rs`).
 pub const REPO_VERSION: u32 = 3;
 /// Format `vxl init` creates unless told otherwise.
-pub const DEFAULT_REPO_VERSION: u32 = 2;
+pub const DEFAULT_REPO_VERSION: u32 = 3;
 /// Group objects kept decoded in memory, for reading sections out of them.
 const BODY_CACHE: usize = 1024;
 /// Default zstd level for objects. Chosen by `examples/zstd_levels.rs`: past
@@ -113,7 +113,7 @@ pub struct Config {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockMode {
-    /// No lock and no pack index (only for `list`, which reads nothing but manifests).
+    /// No lock (`list`, `show`, `diff`: they only read snapshots, which never change).
     None,
     /// Reading objects (restore, verify). Many can run at once.
     Shared,
@@ -299,9 +299,7 @@ impl Repo {
             warnings: Vec::new(),
             _lock: lock_file,
         };
-        if lock != LockMode::None {
-            repo.load_index()?;
-        }
+        repo.load_index()?;
         Ok(repo)
     }
 
@@ -356,12 +354,15 @@ impl Repo {
         self.config.version >= 3
     }
 
-    /// Switch the repository to format 3 (for `migrate`). Needs the exclusive lock.
-    pub fn upgrade_to_grouped(&mut self) -> Result<()> {
-        if self.grouped() {
+    /// Switch the repository's format (for `migrate`). Needs the exclusive lock.
+    pub fn set_format(&mut self, version: u32) -> Result<()> {
+        if !(2..=REPO_VERSION).contains(&version) {
+            bail!("no repository format {version}");
+        }
+        if self.config.version == version {
             return Ok(());
         }
-        let config = Config { version: 3, ..self.config.clone() };
+        let config = Config { version, ..self.config.clone() };
         atomic_write(&self.root.join("config.json"), &self.tmp_dir(), &serde_json::to_vec_pretty(&config)?)?;
         sync_dir(&self.root)?;
         self.config = config;
@@ -626,6 +627,17 @@ impl Repo {
     /// the most sections (see [`Repo::source_body`]), else a plain one. A plain copy is
     /// also kept unless some group copy of the object, anywhere, decodes correctly.
     pub fn repack(&self, packs: &[PackInfo], keep: &HashSet<ObjectId>) -> Result<(u64, u64)> {
+        self.repack_with(packs, keep, false)
+    }
+
+    /// [`Repo::repack`]; with `plain`, an object with a good plain copy keeps only that
+    /// (for `migrate --to 2`).
+    pub fn repack_with(
+        &self,
+        packs: &[PackInfo],
+        keep: &HashSet<ObjectId>,
+        plain: bool,
+    ) -> Result<(u64, u64)> {
         let mut candidates: Vec<(ObjectId, Vec<Loc>)> = Vec::new();
         let mut slot: HashMap<ObjectId, usize> = HashMap::new();
         for p in packs {
@@ -640,7 +652,7 @@ impl Repo {
         let mut b = Builder::default();
         let mut written = Vec::new();
         for (id, locs) in &candidates {
-            for raw in self.choose_copies(id, locs).context("refusing to repack a damaged object")? {
+            for raw in self.choose_copies(id, locs, plain).context("refusing to repack a damaged object")? {
                 b.add(*id, &raw)?;
                 if b.data_len() >= self.config.pack_size {
                     written.push(self.write_pack(std::mem::take(&mut b))?);
@@ -663,7 +675,7 @@ impl Repo {
     }
 
     /// Which of an object's copies at `locs` repack keeps (see [`Repo::repack`]).
-    fn choose_copies(&self, id: &ObjectId, locs: &[Loc]) -> Result<Vec<Vec<u8>>> {
+    fn choose_copies(&self, id: &ObjectId, locs: &[Loc], prefer_plain: bool) -> Result<Vec<Vec<u8>>> {
         let mut best_group: Option<(usize, Vec<u8>)> = None;
         let mut plain: Option<Vec<u8>> = None;
         let mut err = None;
@@ -685,6 +697,9 @@ impl Repo {
                 }
             }
         }
+        if prefer_plain && let Some(raw) = plain {
+            return Ok(vec![raw]);
+        }
         let mut out = Vec::new();
         if let Some((_, raw)) = best_group {
             out.push(raw);
@@ -702,6 +717,35 @@ impl Repo {
             return Err(err.unwrap_or_else(|| anyhow!("object {id} has no readable copy")));
         }
         Ok(out)
+    }
+
+    /// Load `id` from a plain copy only (group copies don't count).
+    pub fn get_plain(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        let mut err = anyhow!("object {id} has no plain copy");
+        for loc in self.copies(id)? {
+            let raw = self.read_loc(id, loc, usize::MAX)?;
+            if !group::is_group(&raw) {
+                match decode_verified(id, &raw) {
+                    Ok(d) => return Ok(d),
+                    Err(e) => err = e,
+                }
+            }
+        }
+        Err(err)
+    }
+
+    /// Whether any copy of any object is a group object.
+    pub fn has_group_objects(&self) -> Result<bool> {
+        let locs: Vec<(ObjectId, Loc)> = {
+            let index = self.index.read().unwrap();
+            index.objects.keys().flat_map(|id| index.copies(id).into_iter().map(|l| (*id, l))).collect()
+        };
+        for (id, loc) in locs {
+            if group::is_group(&self.read_loc(&id, loc, group::MAGIC.len())?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Decode `id` from a group copy only (plain copies don't count).
@@ -751,8 +795,27 @@ impl Repo {
     }
 
     /// Commit a snapshot. This is the moment a backup "exists".
+    /// Chunk lists that are in a table object are left out of the stored JSON.
     pub fn write_snapshot(&self, snap: &Snapshot) -> Result<ObjectId> {
-        let json = serde_json::to_vec(snap)?;
+        let has_tables = snap
+            .worlds
+            .iter()
+            .flat_map(|w| &w.files)
+            .any(|f| matches!(f, crate::manifest::FileEntry::Region { table: Some(_), .. }));
+        let json = if has_tables {
+            if snap.header.version < 3 {
+                bail!("chunk tables need manifest format 3");
+            }
+            let mut s = snap.clone();
+            for f in s.worlds.iter_mut().flat_map(|w| &mut w.files) {
+                if let crate::manifest::FileEntry::Region { table: Some(_), chunks, .. } = f {
+                    chunks.clear();
+                }
+            }
+            serde_json::to_vec(&s)?
+        } else {
+            serde_json::to_vec(snap)?
+        };
         let id = ObjectId::of(&json);
         let packed = zstd::bulk::compress(&json, MANIFEST_ZSTD_LEVEL)?;
         atomic_write(&self.snapshot_path(&id), &self.tmp_dir(), &packed)?;
@@ -790,6 +853,13 @@ impl Repo {
             serde_json::from_slice(&json).with_context(|| format!("parsing snapshot {id}"))?;
         check_version(id, snap.header.version)?;
         snap.upgrade();
+        for f in snap.worlds.iter_mut().flat_map(|w| &mut w.files) {
+            if let crate::manifest::FileEntry::Region { path, table: Some(t), chunks } = f {
+                let bytes = self.get(t).with_context(|| format!("snapshot {id}: chunk table of {path}"))?;
+                *chunks = crate::manifest::decode_table(&bytes)
+                    .with_context(|| format!("snapshot {id}: chunk table of {path}"))?;
+            }
+        }
         Ok(snap)
     }
 

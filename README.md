@@ -43,8 +43,8 @@ cargo install --path .
 
 | command | what it does |
 |---|---|
-| `init [path] [--format 2\|3] [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: format 2, level 6, 16 MiB packs; see [storage formats](#storage-formats)) |
-| `migrate` | convert a repository to format 3; snapshots and their ids stay the same |
+| `init [path] [--format 2\|3] [--zstd-level N] [--pack-size-mb N]` | create an empty repository (defaults: format 3, level 6, 16 MiB packs; see [storage formats](#storage-formats)) |
+| `migrate [--to 2\|3]` | convert a repository to another storage format (default 3) |
 | `backup [folder] [-w world]… [--pre cmd] [--post cmd] [--strict] [-m msg]` | snapshot a world, or every world in a server folder, as one snapshot; only new/changed chunks are stored (see below) |
 | `list` | snapshots, newest first, with what each one added and which worlds it holds |
 | `show <snapshot>` | one snapshot in detail: its worlds, files, chunks and sizes |
@@ -389,21 +389,30 @@ repo/
 
 ### Storage formats
 
-**Format 2** (the default for now) stores every chunk whole: a chunk whose timestamps changed
-because a player walked through it costs a full new copy. **Format 3** stores a chunk as a
-*skeleton* (the chunk without its 16³ sections, each replaced by a short reference) plus
-only the sections that aren't stored yet, all compressed together as one object
-(`src/group.rs`). A reference points either at a section in the same object or at slot `k`
-of an older one, normally the previous version of the same chunk. Each object's header
-lists the objects it reads from, so `prune` keeps those as long as the object is needed.
+**Format 3** (the default) stores a chunk as a *skeleton* (the chunk without its 16³
+sections, each replaced by a short reference) plus only the sections that aren't stored
+yet, all compressed together as one object (`src/group.rs`). A reference points either at
+a section in the same object or at slot `k` of an older one, normally the previous version
+of the same chunk. Each object's header lists the objects it reads from, so `prune` keeps
+those as long as the object is needed. Each region file's chunk list is stored as its own
+object too, so a region whose chunks didn't change costs nothing in the next manifest.
 
-Objects keep their names (the hash of the chunk's NBT), so manifests and snapshot ids are
-the same in both formats, and `vxl migrate` converts a repository in place. It adds a
-format-3 copy of every chunk, decodes and checks every one, and only then removes the old
-copies. If it's interrupted, the repository still works, and running it again continues.
-Every decoded chunk is hash-checked, references included, so a wrong reference can make
-a read fail but never return wrong data. Before storing a chunk, vxl decodes it back and
-compares; if that ever fails, the chunk is stored whole.
+**Format 2** stores every changed chunk whole and lists every chunk in every manifest. A
+chunk whose timestamps changed because a player walked through it costs a full new copy.
+
+Every decoded chunk is hash-checked, references included, so a wrong reference can make a
+read fail but never return wrong data. Before storing a chunk, vxl decodes it back and
+compares; if that ever fails, the chunk is stored whole. Chunk objects keep their names
+(the hash of the chunk's NBT) in both formats.
+
+`vxl migrate` converts in place, either way. It adds the new copy of every chunk, decodes
+and checks every one, and only then removes the old copies. If it's interrupted, the
+repository still works, and running it again continues where it stopped.
+- **To 3**: snapshot ids stay the same. Existing manifests keep their inline chunk lists;
+  snapshots made afterwards use tables.
+- **Back to 2** (`--to 2`): snapshots that have chunk tables get their lists inline again,
+  and so get new ids, since an id is the hash of the manifest. They're printed. The repo is
+  marked format 2 only once no format-3 object is left.
 
 Measured through the real backup code (`examples/format_bench.rs`) on the Paper world
 behind the experiment below: 6 consecutive nightly copies plus one 3 months later. Sizes
@@ -411,25 +420,28 @@ include each snapshot's manifest:
 
 | copy | chunks | format 2 | format 3 | |
 |---|---|---|---|---|
-| 08-08 (first) | 116,566 | 474.5 MB | 481.7 MB | 102% |
-| 08-09 | 116,705 | 25.0 MB | 10.2 MB | 41% |
-| 08-10 | 116,739 | 15.2 MB | 7.4 MB | 48% |
-| 08-11 (idle) | 116,739 | 5.0 MB | 5.0 MB | 100% |
-| 08-12 | 119,402 | 108.4 MB | 40.9 MB | 38% |
-| 08-13 | 119,397 | 33.7 MB | 10.6 MB | 32% |
-| 11-08 | 130,789 | 164.6 MB | 92.3 MB | 56% |
-| **total** | | **826.5 MB** | **648.1 MB** | **78%** |
+| 08-08 (first) | 116,566 | 474.5 MB | 480.8 MB | 101% |
+| 08-09 | 116,705 | 25.0 MB | 5.8 MB | 23% |
+| 08-10 | 116,739 | 15.2 MB | 2.9 MB | 19% |
+| 08-11 (idle) | 116,739 | 5.0 MB | 20 KB | 0% |
+| 08-12 | 119,402 | 108.4 MB | 36.9 MB | 34% |
+| 08-13 | 119,397 | 33.7 MB | 6.2 MB | 18% |
+| 11-08 | 130,789 | 164.6 MB | 88.5 MB | 54% |
+| **total** | | **826.5 MB** | **621.2 MB** | **75%** |
 
-Restoring the newest snapshot from format 3 took 5.2 s and gave all 130,789 chunks back
-identical. `verify` reported no problems in either repo (format 2 took 1.8 s, format 3
-took 3.0 s, since every chunk is rebuilt). Migrating a copy of the format-2 repo took
-31 s and gave 664 MB on disk, the same as backing up in format 3 from the start.
-Entity and POI chunks have no sections and stay whole. A first backup takes ~1.7× as long
-(5.8 s vs 3.5 s here), later ones ~1.2×. The ~5 MB the idle night costs in both formats is
-its manifest, which is now about half of a typical format-3 night (see the roadmap).
+- **Restore:** the newest snapshot came back from format 3 in 5.4 s, with all 130,789
+  chunks identical.
+- **Verify:** no problems in either repo (2.0 s for format 2, 2.3 s for format 3).
+- **Migrate to 3:** a copy of the format-2 repo took 30 s and ended at 664 MB on disk. Its
+  old manifests stay inline, against 636 MB for a repo made in format 3.
+- **Migrate back to 2:** a copy of the format-3 repo took 28 s, came back to exactly the
+  format-2 size (798.9 MB), verified clean, and restored identical.
+- **Not split:** entity and POI chunks have no sections and stay whole.
+- **Speed:** a first backup takes longer (5.8–9.7 s across two runs vs 3.5 s); later
+  ones take about as long as in format 2.
 
-Format 3 can't be opened by vxl versions before it. Try it with `vxl init --format 3`, or
-`vxl migrate` a copy of an existing repo first.
+Format 3 can't be opened by builds older than it; `vxl init --format 2` makes a format-2
+repo.
 
 ### Choosing the zstd level
 
@@ -510,6 +522,8 @@ rather than a sequential id, so the repo needs no counter.
 
 - Chunks the server has *loaded* get new `LastUpdate`/`InhabitedTime` values in their NBT,
   so they count as changed even when no block moved. Only chunks nobody visited dedupe for free.
+- In format 3, damage to one stored object can also break the chunks that read sections
+  from it (often later versions of the same chunk). `verify` reports each of them.
 - The pack index is held in memory: roughly 100 bytes per object, so ~100 MB for a
   million distinct chunks across all snapshots.
 - Repositories made by the first development build (loose object files, format v1)
@@ -529,6 +543,7 @@ rather than a sequential id, so the repo needs no counter.
 | `src/pack.rs` | the pack file format (pure: bytes in, bytes out) |
 | `src/group.rs` | format 3 group objects: skeleton + sections, references (pure) |
 | `src/chunk_store.rs` | format 3: which existing sections a new chunk can point at, when to reuse an object |
+| `src/commands/migrate.rs` | `vxl migrate`: format 2 ⇄ 3 in place |
 | `src/manifest.rs` | the snapshot data structures (serde) |
 | `src/world.rs` | finds the worlds in a server folder, walks a world and classifies files |
 | `src/hooks.rs` | `--pre`/`--post` commands and Ctrl-C/SIGTERM handling |

@@ -12,7 +12,7 @@ use crate::anvil;
 use crate::chunk_store::ChunkStore;
 use crate::commands::list::list;
 use crate::hooks::check_interrupted;
-use crate::manifest::{ChunkEntry, FORMAT_VERSION, FileEntry, Snapshot, SnapshotHeader, Stats, World};
+use crate::manifest::{self, ChunkEntry, FileEntry, Snapshot, SnapshotHeader, Stats, World};
 use crate::repo::{ObjectId, Repo};
 use crate::world::{self, FoundWorld, Kind, Scan, WorldFile};
 
@@ -83,7 +83,7 @@ fn grouped<'a>(repo: &'a Repo, source: &str, warnings: &mut Vec<String>) -> Resu
         };
         for w in snap.worlds {
             for f in w.files {
-                let FileEntry::Region { path, chunks } = f else { continue };
+                let FileEntry::Region { path, chunks, .. } = f else { continue };
                 let live: Vec<&ChunkEntry> = chunks.iter().filter(|c| !c.verbatim).collect();
                 trusted.extend(live.iter().map(|c| c.hash));
                 if src == source {
@@ -134,7 +134,8 @@ pub fn backup(repo: &Repo, source: &Path, opts: &Options, progress: &ProgressBar
     repo.flush()?;
     let snap = Snapshot {
         header: SnapshotHeader {
-            version: FORMAT_VERSION,
+            // Format 3 repos store chunk lists as tables (manifest version 3).
+            version: if repo.grouped() { 3 } else { 2 },
             created: Utc::now(),
             message: opts.message.clone(),
             source: source_abs.display().to_string(),
@@ -207,6 +208,18 @@ fn backup_world(
         entries.push(d.entry);
     }
     entries.sort_by(|a, b| a.path().cmp(b.path()));
+    if g.is_some() {
+        for e in &mut entries {
+            if let FileEntry::Region { table, chunks, .. } = e {
+                let put = repo.put(&manifest::encode_table(chunks))?;
+                *table = Some(put.id);
+                if let Some(n) = put.stored {
+                    stats.new_objects += 1;
+                    stats.stored_bytes += n;
+                }
+            }
+        }
+    }
     Ok((entries, stats))
 }
 
@@ -432,7 +445,7 @@ fn backup_region(
         stats.world_bytes += fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     }
     Ok(Done {
-        entry: FileEntry::Region { path: f.rel.clone(), chunks },
+        entry: FileEntry::Region { path: f.rel.clone(), table: None, chunks },
         stats,
         warnings,
         consumed,

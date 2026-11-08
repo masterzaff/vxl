@@ -251,7 +251,7 @@ fn migrate_keeps_every_snapshot_and_shrinks_the_repo() {
         want.push((r.id, contents(&env.world)));
     }
     let before = pack_bytes(&dir);
-    let r = migrate::migrate(&mut open(&dir), &ProgressBar::hidden()).unwrap();
+    let r = migrate::migrate(&mut open(&dir), 3, &ProgressBar::hidden()).unwrap();
     assert_eq!(r.snapshots, 5);
     assert_eq!(r.converted, r.chunks);
     assert_eq!(open(&dir).config.version, 3);
@@ -275,7 +275,7 @@ fn migrate_keeps_every_snapshot_and_shrinks_the_repo() {
     drop(repo);
 
     // Again: nothing left to do. And backups carry on in format 3.
-    let again = migrate::migrate(&mut open(&dir), &ProgressBar::hidden()).unwrap();
+    let again = migrate::migrate(&mut open(&dir), 3, &ProgressBar::hidden()).unwrap();
     assert_eq!(again.converted, 0);
     env.write_night(9, 5);
     let r = backup(&dir, &env.world);
@@ -296,7 +296,7 @@ fn an_interrupted_migration_leaves_a_working_repo() {
     // Stop after converting some chunks: format 3, plain and group copies side by side.
     {
         let mut repo = open(&dir);
-        repo.upgrade_to_grouped().unwrap();
+        repo.set_format(3).unwrap();
         let store = ChunkStore::new(&repo, HashSet::new());
         let ids: Vec<ObjectId> = repo.list_objects().into_iter().map(|(id, _)| id).collect();
         for id in ids.iter().step_by(2) {
@@ -315,7 +315,7 @@ fn an_interrupted_migration_leaves_a_working_repo() {
     for (id, c) in &want {
         assert_eq!(&restored(&env, &dir, id), c);
     }
-    migrate::migrate(&mut open(&dir), &ProgressBar::hidden()).unwrap();
+    migrate::migrate(&mut open(&dir), 3, &ProgressBar::hidden()).unwrap();
     for (id, c) in &want {
         assert_eq!(&restored(&env, &dir, id), c);
     }
@@ -332,4 +332,73 @@ fn formats() {
     fs::write(p.join("config.json"), cfg).unwrap();
     let err = Repo::open(&p, LockMode::Shared).err().unwrap().to_string();
     assert!(err.contains("newer"), "{err}");
+}
+
+#[test]
+fn unchanged_regions_cost_nothing_and_manifests_are_small() {
+    let env = Env::new();
+    let (v2, v3) = (env.repo("v2", 2), env.repo("v3", 3));
+    env.write_night(2, 0);
+    let manifest = |repo: &Path, id: &ObjectId| {
+        fs::metadata(repo.join("snapshots").join(format!("{}.json.zst", id.hex()))).unwrap().len()
+    };
+    let (a2, a3) = (backup(&v2, &env.world), backup(&v3, &env.world));
+    let (b2, b3) = (backup(&v2, &env.world), backup(&v3, &env.world));
+    assert_eq!(b3.stats.stored_bytes, 0, "same chunk tables as last time");
+    assert_eq!(b2.stats.stored_bytes, 0);
+    assert!(
+        manifest(&v3, &b3.id) * 4 < manifest(&v2, &b2.id),
+        "{} vs {}",
+        manifest(&v3, &b3.id),
+        manifest(&v2, &b2.id)
+    );
+    // One changed night: only the tables of regions that changed are new.
+    env.write_night(2, 1);
+    let c3 = backup(&v3, &env.world);
+    assert!(c3.stats.new_objects > c3.stats.new_chunks, "chunks plus their regions' tables");
+    for id in [a3.id, b3.id, c3.id] {
+        let snap = open(&v3).load_snapshot(&id).unwrap();
+        assert!(snap.worlds[0].files.iter().any(|f| matches!(f, vxl::manifest::FileEntry::Region { chunks, table: Some(_), .. } if !chunks.is_empty())));
+    }
+    assert_eq!(restored(&env, &v3, &c3.id), contents(&env.world));
+    let _ = a2;
+}
+
+#[test]
+fn back_to_format_2_and_forward_again() {
+    let env = Env::new();
+    let dir = env.repo("repo", 3);
+    let mut want = Vec::new();
+    for n in 0..4 {
+        env.write_night(5, n);
+        let r = backup(&dir, &env.world);
+        want.push((r.id, contents(&env.world)));
+    }
+    let r = migrate::migrate(&mut open(&dir), 2, &ProgressBar::hidden()).unwrap();
+    assert_eq!(r.snapshots, 4);
+    assert_eq!(r.renamed.len(), 4, "manifests with chunk tables get new ids");
+    let repo = open(&dir);
+    assert_eq!(repo.config.version, 2);
+    assert!(!repo.has_group_objects().unwrap());
+    drop(repo);
+    let new_id = |old: &ObjectId| r.renamed.iter().find(|(a, _)| a == old).unwrap().1;
+    for (id, c) in &want {
+        assert_eq!(&restored(&env, &dir, &new_id(id)), c);
+    }
+    verify_all(&dir);
+    // Nothing format 3 left behind: every object is a plain zstd object.
+    let repo = open(&dir);
+    for (id, _) in repo.list_objects() {
+        let raw = repo.read_raw(&id).unwrap();
+        assert!(zstd::stream::decode_all(&raw[..]).is_ok_and(|d| ObjectId::of(&d) == id));
+    }
+    drop(repo);
+    // Again is a no-op; and forward to 3 keeps those ids.
+    assert!(migrate::migrate(&mut open(&dir), 2, &ProgressBar::hidden()).unwrap().renamed.is_empty());
+    let f = migrate::migrate(&mut open(&dir), 3, &ProgressBar::hidden()).unwrap();
+    assert!(f.renamed.is_empty());
+    for (id, c) in &want {
+        assert_eq!(&restored(&env, &dir, &new_id(id)), c);
+    }
+    verify_all(&dir);
 }

@@ -89,8 +89,9 @@ enum Cmd {
         /// Target size of pack files, in MiB.
         #[arg(long, default_value_t = repo::DEFAULT_PACK_SIZE >> 20)]
         pack_size_mb: u64,
-        /// Storage format. 3 stores each chunk's unchanged sections only once, which makes
-        /// nightly backups several times smaller; older vxl versions can't read it.
+        /// Storage format. 3 stores each chunk's unchanged sections only once, and each
+        /// region's chunk list only when it changed, which makes nightly backups several
+        /// times smaller. 2 stores every changed chunk whole; `vxl migrate --to 2` converts back.
         #[arg(long, default_value_t = repo::DEFAULT_REPO_VERSION, value_parser = clap::value_parser!(u32).range(2..=3))]
         format: u32,
     },
@@ -212,9 +213,13 @@ enum Cmd {
         #[command(flatten)]
         repo: RepoArg,
     },
-    /// Convert a repository to storage format 3 (see `vxl init --format`). Snapshots and
-    /// their ids stay the same; old copies are removed only after the new ones check out.
+    /// Convert a repository to another storage format (see `vxl init --format`). Old copies
+    /// of the data are removed only after the new ones check out. To 3, snapshot ids stay
+    /// the same; back to 2, snapshots made in format 3 get new ids (printed).
     Migrate {
+        /// The format to convert to.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(2..=3))]
+        to: u32,
         #[command(flatten)]
         repo: RepoArg,
     },
@@ -313,14 +318,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("initialized empty vxl repository (format {format}) in {}", path.display());
         }
 
-        Cmd::Migrate { repo } => {
+        Cmd::Migrate { repo, to } => {
             let mut repo = open(&repo, &cfg, LockMode::Exclusive)?;
             let was = repo.config.version;
             let pb = bar("converting", false);
-            let r = migrate::migrate(&mut repo, &pb)?;
+            let r = migrate::migrate(&mut repo, to, &pb)?;
             pb.finish_and_clear();
+            let n = r.renamed.iter().map(|(a, b)| repo::short_len(&[*a, *b])).max().unwrap_or(6);
+            for (old, new) in &r.renamed {
+                println!("snapshot {} is now {}", &old.hex()[..n], &new.hex()[..n]);
+            }
             println!(
-                "format {was} → 3: {} snapshots, {} chunks ({} converted, {} unchanged) | {} → {}",
+                "format {was} → {to}: {} snapshots, {} chunks ({} converted, {} unchanged) | {} → {}",
                 r.snapshots,
                 thousands(r.chunks),
                 thousands(r.converted),
