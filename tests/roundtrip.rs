@@ -80,7 +80,7 @@ fn do_backup(env: &Env, msg: &str) -> backup::BackupReport {
 
 fn do_restore(env: &Env, id: &ObjectId, name: &str) -> std::path::PathBuf {
     let target = env.base.join(name);
-    restore::restore(&repo(env), id, &target, &hidden()).unwrap();
+    restore::restore(&repo(env), id, &target, restore::Mode::Fresh, &hidden()).unwrap();
     target
 }
 
@@ -238,7 +238,7 @@ fn verify_catches_damage_and_restore_refuses_non_empty_target() {
     let busy = env.base.join("busy");
     fs::create_dir_all(&busy).unwrap();
     fs::write(busy.join("keep.txt"), b"mine").unwrap();
-    assert!(restore::restore(&repo(&env), &id, &busy, &hidden()).is_err());
+    assert!(restore::restore(&repo(&env), &id, &busy, restore::Mode::Fresh, &hidden()).is_err());
     assert_eq!(fs::read(busy.join("keep.txt")).unwrap(), b"mine");
 
     let (victim, _) = repo(&env).list_objects().unwrap()[0];
@@ -288,4 +288,100 @@ fn cli_smoke() {
     assert!(target.join("region/r.0.0.mca").exists());
     assert!(vxl(&["verify"]).contains("all OK"));
     assert!(vxl(&["prune", "--keep-last", "1"]).contains("removed 0 snapshots"));
+}
+
+/// A world that has moved on since the snapshot: edited chunks, a newer
+/// level.dat, and a region + file the snapshot never had.
+fn diverge(env: &Env) {
+    let edited = |cx: i32, _cz: i32| if cx < 4 { 9 } else { 0 };
+    synth::write_world(&env.world, 8, &[(0, 0), (1, 0)], 20, Compression::Zlib, edited).unwrap();
+    fs::write(env.world.join("level.dat"), b"newer level.dat").unwrap();
+    fs::write(env.world.join("notes.txt"), b"added after the snapshot").unwrap();
+}
+
+#[test]
+fn force_replace_overwrites_but_keeps_extras() {
+    let env = setup();
+    synth::write_world(&env.world, 8, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    let mut snap = contents(&env.world);
+    snap.remove("session.lock");
+    let id = do_backup(&env, "x").id;
+    diverge(&env);
+
+    let r = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Replace, &hidden()).unwrap();
+    assert_eq!(r.replaced, 3); // level.dat, playerdata, region/r.0.0.mca
+    let now = contents(&env.world);
+    for (path, c) in &snap {
+        assert_eq!(&now[path], c, "{path} should be back to the snapshot");
+    }
+    // Files the snapshot doesn't have are left alone.
+    assert!(now.contains_key("notes.txt") && now.contains_key("region/r.1.0.mca"));
+    assert!(env.world.join("session.lock").exists());
+    assert_no_staging(&env.world);
+}
+
+#[test]
+fn force_wipe_makes_target_exactly_the_snapshot() {
+    let env = setup();
+    synth::write_world(&env.world, 8, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    let mut snap = contents(&env.world);
+    snap.remove("session.lock");
+    let id = do_backup(&env, "x").id;
+    diverge(&env);
+    fs::create_dir_all(env.world.join("stats/deep")).unwrap();
+    fs::write(env.world.join("stats/deep/x.json"), b"{}").unwrap();
+
+    let r = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Wipe, &hidden()).unwrap();
+    assert!(r.wiped > 0);
+    assert_eq!(contents(&env.world), snap);
+    assert!(!env.world.join("stats").exists());
+    assert_no_staging(&env.world);
+}
+
+#[test]
+fn force_refuses_non_worlds_and_failed_restores_change_nothing() {
+    let env = setup();
+    synth::write_world(&env.world, 8, &[(0, 0)], 20, Compression::Zlib, |_, _| 0).unwrap();
+    let id = do_backup(&env, "x").id;
+
+    // Not a world → refused, untouched, for both modes.
+    let home = env.base.join("not-a-world");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("thesis.docx"), b"precious").unwrap();
+    for mode in [restore::Mode::Replace, restore::Mode::Wipe] {
+        let err = restore::restore(&repo(&env), &id, &home, mode, &hidden()).err().unwrap();
+        assert!(err.to_string().contains("no level.dat"), "{err}");
+        assert_eq!(fs::read(home.join("thesis.docx")).unwrap(), b"precious");
+    }
+
+    // Damage one object: the restore fails while staging, and the live world
+    // must be exactly as it was (and no staging folder left behind).
+    diverge(&env);
+    let before = contents(&env.world);
+    let victim = repo(&env).list_objects().unwrap()[0].0.hex();
+    let path = env.repo_dir.join("objects").join(&victim[..2]).join(&victim[2..]);
+    fs::write(&path, b"garbage").unwrap();
+    let err = restore::restore(&repo(&env), &id, &env.world, restore::Mode::Wipe, &hidden()).err().unwrap();
+    assert!(format!("{err:#}").contains("was not changed"), "{err:#}");
+    assert_eq!(contents(&env.world), before);
+    assert_no_staging(&env.world);
+}
+
+#[test]
+fn staging_leftovers_are_not_backed_up() {
+    let env = setup();
+    synth::write_world(&env.world, 8, &[], 0, Compression::Zlib, |_, _| 0).unwrap();
+    let stale = env.world.join(".vxl-staging-123/region");
+    fs::create_dir_all(&stale).unwrap();
+    fs::write(stale.join("r.0.0.mca"), b"").unwrap();
+    assert!(world::scan(&env.world).unwrap().files.iter().all(|f| !f.rel.contains("vxl-staging")));
+}
+
+fn assert_no_staging(dir: &Path) {
+    let left: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".vxl-staging"))
+        .collect();
+    assert!(left.is_empty(), "staging left behind: {left:?}");
 }

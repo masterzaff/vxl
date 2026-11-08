@@ -53,8 +53,15 @@ enum Cmd {
     Restore {
         /// Snapshot id (any unique prefix).
         snapshot: String,
-        /// Folder to restore into; must not exist or be empty.
+        /// Folder to restore into; must not exist or be empty unless --force/--force-wipe.
         target: PathBuf,
+        /// Target is an existing world: overwrite the files the snapshot has, keep any others.
+        #[arg(long, conflicts_with = "force_wipe")]
+        force: bool,
+        /// Target is an existing world: delete everything in it first, so it ends up exactly
+        /// like the snapshot. This is what you want to roll a world back.
+        #[arg(long)]
+        force_wipe: bool,
         #[command(flatten)]
         repo: RepoArg,
     },
@@ -167,14 +174,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
 
-        Cmd::Restore { snapshot, target, repo } => {
+        Cmd::Restore { snapshot, target, force, force_wipe, repo } => {
             let repo = open(&repo, LockMode::Shared)?;
             let id = repo.resolve(&snapshot)?;
+            let mode = match (force, force_wipe) {
+                (_, true) => restore::Mode::Wipe,
+                (true, _) => restore::Mode::Replace,
+                _ => restore::Mode::Fresh,
+            };
+            if mode != restore::Mode::Fresh {
+                let source = repo.load_header(&id)?.source;
+                if target.canonicalize().is_ok_and(|t| t.display().to_string() == source) {
+                    eprintln!(
+                        "warning: restoring over the world this snapshot came from; make sure the server is stopped"
+                    );
+                }
+            }
             let pb = bar("restoring", false);
-            let r = restore::restore(&repo, &id, &target, &pb)?;
+            let r = restore::restore(&repo, &id, &target, mode, &pb)?;
             pb.finish_and_clear();
+            let extra = match mode {
+                restore::Mode::Fresh => String::new(),
+                restore::Mode::Replace => format!(" | {} replaced", thousands(r.replaced)),
+                restore::Mode::Wipe => format!(" | wiped {} old entries", thousands(r.wiped)),
+            };
             println!(
-                "restored {} into {} | {} files | {} chunks",
+                "restored {} into {} | {} files | {} chunks{extra}",
                 short(&r.id, 6),
                 target.display(),
                 thousands(r.files),

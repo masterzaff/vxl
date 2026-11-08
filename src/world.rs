@@ -46,7 +46,14 @@ pub fn scan(world: &Path) -> Result<Scan> {
     if !world.join("level.dat").exists() {
         warnings.push(format!("{} has no level.dat — is this really a world folder?", world.display()));
     }
-    for entry in WalkDir::new(world).follow_links(false).sort_by_file_name() {
+    // Leftovers of an interrupted `restore --force…` are not part of the world.
+    let not_staging = |e: &walkdir::DirEntry| {
+        e.depth() != 1
+            || !e.file_name().to_string_lossy().starts_with(crate::commands::restore::STAGING_PREFIX)
+    };
+    for entry in
+        WalkDir::new(world).follow_links(false).sort_by_file_name().into_iter().filter_entry(not_staging)
+    {
         let entry = entry.with_context(|| format!("reading {}", world.display()))?;
         let ft = entry.file_type();
         if ft.is_dir() {

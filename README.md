@@ -36,11 +36,27 @@ cargo install --path .
 | `init <path> [--zstd-level N]` | create an empty repository (default level 6, see below) |
 | `backup <world> [-m msg]` | snapshot a world; only new/changed chunks are stored |
 | `list` | snapshots, newest first, with what each one added |
-| `restore <id> <folder>` | rebuild a snapshot into a **new or empty** folder; never touches the live world |
+| `restore <id> <folder> [--force \| --force-wipe]` | rebuild a snapshot into a new or empty folder, or over an existing world (see below) |
 | `verify [id]` | re-read and re-hash every object a snapshot (default: all) needs |
 | `prune [--keep-last N] [--dry-run]` | drop old snapshots and garbage-collect data nothing references |
 
 Snapshot ids can be shortened to any unique prefix, like git.
+
+## Restoring over an existing world
+
+By default `restore` only writes into a new or empty folder. To roll back a world in place
+(**stop the server first**):
+
+- `--force-wipe`: delete everything in the folder, then restore. The folder ends up exactly
+  like the snapshot. This is what you normally want for a rollback.
+- `--force`: overwrite only the files the snapshot has and leave every other file alone.
+  Careful: region files created after the snapshot stay at their newer version, so areas
+  explored later are *not* rolled back.
+
+Both rebuild the full snapshot in a `.vxl-staging-*` folder inside the target first and only
+move files into place once that has worked, so a failed restore (e.g. a damaged object)
+leaves the world unchanged. They refuse to touch a folder without `level.dat`, so a typo
+can't wipe your home directory.
 
 ## Backing up a running server
 
@@ -82,8 +98,11 @@ repo/
 - **Restore** rebuilds each region file and recompresses each chunk with its original
   compression type. The result is chunk-for-chunk identical to the original, not
   byte-for-byte (sector layout and zlib output may differ); Minecraft doesn't care.
-- **Damaged data**: a chunk that won't decompress is kept as its raw bytes and restored
-  exactly as it was; a region file that isn't valid is stored as a plain file. Both cause a warning.
+- **Damaged data**: a chunk that won't decompress is stored as its raw compressed bytes
+  (`"verbatim": true` in the manifest) and written back unchanged on restore, so it's exactly
+  as broken as before, never worse. A region file that isn't valid at all is stored as a
+  plain file. A chunk whose header points outside the file (or at a missing `.mcc`) has no
+  bytes to keep and is skipped. All of these print a warning.
 - **Prune** deletes manifests first, then objects. If any kept snapshot can't be read,
   it refuses to delete objects at all.
 
