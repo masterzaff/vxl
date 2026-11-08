@@ -153,7 +153,10 @@ Steps:
 - ✅ **Offsite copies, documented.** Packs never change once written, so `rsync`/`rclone` of a
   repo is cheap and incremental; README shows a two-step copy (packs first) under a shared
   `flock`. Built-in S3 target and encryption only if needed.
-- **Fuzzing** the parsers that read untrusted bytes (anvil, NBT, pack) with `cargo-fuzz`.
+- **Fuzzing** the parsers that read untrusted bytes (anvil, NBT, pack). ✅ Stable-Rust
+  mutation tests (`tests/robustness.rs`: flips, extreme lengths, truncation, splices, hostile
+  nesting) run with every `cargo test`; they found an overflow in the pack-index bounds check
+  (fixed). Still open: coverage-guided `cargo-fuzz` targets (needs nightly).
 - **Big-repo speed.** ✅ Snapshot headers are cached (`cache/headers/`), so `list` and
   `prune` don't decompress whole manifests. Still open: a combined pack-index cache, so
   `open` reads one file instead of every pack's index once there are thousands of packs.

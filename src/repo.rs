@@ -717,7 +717,11 @@ mod tests {
         assert_eq!(repo.load_header(&id).unwrap().message.as_deref(), Some("hi"));
 
         fs::write(&cache, b"{not json").unwrap();
-        assert_eq!(repo.load_header(&id).unwrap().message.as_deref(), Some("hi"), "bad cache: read the manifest");
+        assert_eq!(
+            repo.load_header(&id).unwrap().message.as_deref(),
+            Some("hi"),
+            "bad cache: read the manifest"
+        );
 
         repo.delete_snapshot(&id).unwrap();
         assert!(!cache.exists());

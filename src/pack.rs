@@ -123,9 +123,11 @@ pub fn read_index(path: &Path) -> Result<(u64, Vec<Entry>)> {
     }
     let count = u32::from_le_bytes(trailer[..4].try_into().unwrap()) as u64;
     let index_offset = u64::from_le_bytes(trailer[4..12].try_into().unwrap());
-    if index_offset < MAGIC.len() as u64
-        || index_offset + count * ENTRY_LEN as u64 + TRAILER_LEN as u64 != size
-    {
+    // Checked: a damaged trailer can hold any value, and a wrapped sum could pass the
+    // check and make us allocate `count` entries' worth of garbage.
+    let end =
+        index_offset.checked_add(count * ENTRY_LEN as u64).and_then(|e| e.checked_add(TRAILER_LEN as u64));
+    if index_offset < MAGIC.len() as u64 || end != Some(size) {
         bail!("corrupt pack index");
     }
     let mut raw = vec![0u8; (count as usize) * ENTRY_LEN];
@@ -139,7 +141,9 @@ pub fn read_index(path: &Path) -> Result<(u64, Vec<Entry>)> {
                 offset: u64::from_le_bytes(e[32..40].try_into().unwrap()),
                 len: u32::from_le_bytes(e[40..44].try_into().unwrap()),
             };
-            if entry.offset < MAGIC.len() as u64 || entry.offset + entry.len as u64 > index_offset {
+            if entry.offset < MAGIC.len() as u64
+                || entry.offset.checked_add(entry.len as u64).is_none_or(|end| end > index_offset)
+            {
                 bail!("corrupt pack index (entry out of bounds)");
             }
             Ok(entry)
