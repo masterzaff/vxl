@@ -163,9 +163,10 @@ Steps:
   `open` reads one file instead of seeking into thousands of packs.
 - **Close the untested paths:** an LZ4 world, real use on Windows.
 - **Releases.** ✅ `.github/workflows/release.yml`: a `v*` tag builds, tests and attaches
-  static x86_64 Linux (musl), arm64 macOS and x86_64 Windows binaries plus `SHA256SUMS`;
-  running it by hand is a dry run (verified). Still open: arm64 Linux (Raspberry Pi, ARM
-  VPSes), and cutting the first release.
+  static x86_64 and arm64 Linux (musl; arm64 cross-built with cargo-zigbuild, so its tests
+  run only on the other targets), arm64 macOS and x86_64 Windows binaries plus `SHA256SUMS`;
+  running it by hand is a dry run (verified, arm64 binary checked to be static aarch64).
+  Still open: cutting the first release.
 
 ## Open questions
 
