@@ -161,7 +161,10 @@ Steps:
   `prune` don't decompress whole manifests. Still open: a combined pack-index cache, so
   `open` reads one file instead of every pack's index once there are thousands of packs.
 - **Close the untested paths:** an LZ4 world, real use on Windows.
-- **Releases.** Prebuilt binaries via GitHub Releases, so servers don't need Rust.
+- **Releases.** ✅ `.github/workflows/release.yml`: a `v*` tag builds, tests and attaches
+  static x86_64 Linux (musl), arm64 macOS and x86_64 Windows binaries plus `SHA256SUMS`;
+  running it by hand is a dry run (verified). Still open: arm64 Linux (Raspberry Pi, ARM
+  VPSes), and cutting the first release.
 
 ## Open questions
 

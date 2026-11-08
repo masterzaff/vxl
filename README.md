@@ -31,6 +31,10 @@ Set `VXL_REPO=/backups/survival-repo` to skip `--repo` every time, or put everyt
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64, static, any distro), macOS (Apple silicon) and Windows
+(x86_64) are attached to each [release](https://github.com/masterzaff/vxl/releases), with
+a `SHA256SUMS` file. Unpack and put `vxl` on your `PATH`. Or build from source:
+
 ```bash
 cargo install --path .
 ```
