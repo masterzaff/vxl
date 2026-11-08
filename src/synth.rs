@@ -147,6 +147,13 @@ fn bits_for(n: usize, min: usize) -> usize {
 /// Uncompressed NBT for chunk `(cx, cz)`. Changing `edit` changes a handful of
 /// blocks and the timestamps, like a player passing through.
 pub fn chunk_nbt(seed: u64, cx: i32, cz: i32, edit: u32) -> Vec<u8> {
+    chunk_nbt_ex(seed, cx, cz, edit, edit)
+}
+
+/// Like [`chunk_nbt`], with blocks and timestamps controlled separately:
+/// `edit` = how many near-surface blocks were changed (out of 4096 odds),
+/// `tick` = how often the chunk was loaded (drives `LastUpdate`/`InhabitedTime`).
+pub fn chunk_nbt_ex(seed: u64, cx: i32, cz: i32, edit: u32, tick: u32) -> Vec<u8> {
     let height = |x: i32, z: i32| -> i32 {
         let (wx, wz) = ((cx * 16 + x) as f64, (cz * 16 + z) as f64);
         (50.0 + 30.0 * noise(seed, wx / 64.0, wz / 64.0) + 8.0 * noise(seed + 1, wx / 16.0, wz / 16.0)) as i32
@@ -322,8 +329,8 @@ pub fn chunk_nbt(seed: u64, cx: i32, cz: i32, edit: u32) -> Vec<u8> {
         ("zPos", Tag::Int(cz)),
         ("yPos", Tag::Int(-4)),
         ("Status", s("minecraft:full")),
-        ("LastUpdate", Tag::Long(2_000_000 + edit as i64 * 1200)),
-        ("InhabitedTime", Tag::Long(edit as i64 * 37)),
+        ("LastUpdate", Tag::Long(2_000_000 + tick as i64 * 1200)),
+        ("InhabitedTime", Tag::Long(tick as i64 * 37)),
         ("isLightOn", Tag::Byte(1)),
         ("sections", Tag::List(10, sections)),
         ("block_entities", Tag::List(10, block_entities)),

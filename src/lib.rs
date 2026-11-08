@@ -6,6 +6,7 @@
 //! - [`pack`]     : the pack file format objects are stored in
 //! - [`manifest`] : the snapshot format (what a backup *is*)
 //! - [`world`]    : walking a world folder and classifying files
+//! - [`nbt`], [`transform`]: byte-exact NBT + experimental reversible chunk transforms
 //! - [`commands`] : the actual `init/backup/list/restore/prune/verify` logic
 //!
 //! `main.rs` is just a thin CLI wrapper around this.
@@ -13,8 +14,10 @@
 pub mod anvil;
 pub mod commands;
 pub mod manifest;
+pub mod nbt;
 pub mod pack;
 pub mod repo;
+pub mod transform;
 pub mod util;
 pub mod world;
 

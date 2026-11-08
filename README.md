@@ -144,6 +144,33 @@ speed is about the same at every level. Chunks deduplicate across snapshots, so
 the level matters less over time than it might seem. Run it on your own world to check;
 `vxl init --zstd-level N` overrides the default (it's fixed per repository).
 
+### Experiment: transforming chunks before storing them
+
+`examples/nbt_bench.rs` simulates a series of backups with reversible chunk transforms
+(`src/nbt.rs`, `src/transform.rs`; not used by the CLI yet):
+
+- **unpack**: expand bit-packed block/biome/heightmap arrays to one value per byte
+- **split**: store each chunk as a small skeleton plus one object per 16³ section,
+  so unchanged sections dedupe even when the chunk's timestamps change
+
+```bash
+cargo run --release --example nbt_bench                       # synthetic
+cargo run --release --example nbt_bench -- day1/ day2/ day3/  # real world copies, oldest first
+```
+
+Synthetic result (4,096 chunks, 5 nights, 30% of chunks loaded and 3% edited per night):
+
+| method | 1st backup | avg night | total after 5 nights |
+|---|---|---|---|
+| whole (today) | 25.8 MB | 8.2 MB | 67.0 MB |
+| unpack | 105% | 105% | 105% |
+| split | 133% | **25%** | **66%** |
+| split + unpack | 139% | 23% | 68% |
+
+Unpacking didn't help on this data. Splitting makes nightly backups ~4× smaller but the
+first one ~⅓ bigger (sections compressed one by one lose shared context), and it's ~3.5×
+slower. Every transformed chunk was verified byte-identical; zero fallbacks.
+
 ## Known limitations
 
 - Chunks the server has *loaded* get new `LastUpdate`/`InhabitedTime` values in their NBT,
